@@ -250,6 +250,15 @@ const psolid = (x, y, z) => {
 let pool = null;
 try { pool = self.workerpool.pool('worker.js', { minWorkers: 'max', maxWorkers: 4 }); } catch (e) {}
 let inflight = 0;
+let poolFails = 0;
+// if workers keep dying (missing script, importScripts error...) stop paying
+// the spawn-fail-reject round-trip per task and run everything on-thread
+function poolFail() {
+  if (pool && ++poolFails >= 3) {
+    const p = pool; pool = null;
+    try { p.terminate(); } catch (e) {}
+  }
+}
 
 function chunkState(cx, cz) {
   const k = ckey(cx, cz);
@@ -264,48 +273,54 @@ function onVox(c, data) {
   c.dirty = true;
   for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
     const n = store.get(ckey(c.cx + dx, c.cz + dz));
-    if (n && n.vox && n.mesh) n.dirty = true;          // its border faces changed
+    if (n && n.vox) n.dirty = true;                    // its border faces changed
   }
   ensureSpawn();
 }
+
+const meshQ = [];                       // worker results awaiting geometry upload
+const MAXAPPLY = 4;                     // geometry builds per frame — no burst stalls
 
 function runGen(c) {
   c.genIn = true; inflight++;
   const e = edits.get(ckey(c.cx, c.cz));
   const ed = e ? [...e] : null;
   const done = data => { inflight--; c.genIn = false; onVox(c, data); };
-  if (pool) pool.exec('gen', [{ cx: c.cx, cz: c.cz, edits: ed }]).then(r => done(r.data), () => done(WC.genChunk(c.cx, c.cz, ed)));
-  else done(WC.genChunk(c.cx, c.cz, ed));
+  const sync = () => setTimeout(() => done(WC.genChunk(c.cx, c.cz, ed)), 0);
+  if (pool) pool.exec('gen', [{ cx: c.cx, cz: c.cz, edits: ed }]).then(r => done(r.data), () => { poolFail(); sync(); });
+  else sync();
 }
 
 function runMesh(c) {
   c.meshIn = true; c.dirty = false; inflight++;
   const nb = (dx, dz) => { const n = store.get(ckey(c.cx + dx, c.cz + dz)); return n ? n.vox : null; };
   const args = { cx: c.cx, cz: c.cz, self: c.vox, px: nb(1, 0), nx: nb(-1, 0), pz: nb(0, 1), nz: nb(0, -1) };
-  const apply = r => {
-    inflight--; c.meshIn = false;
-    if (store.get(ckey(c.cx, c.cz)) !== c || !c.vox) return;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(r.pos, 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(r.nor, 3));
-    g.setAttribute('uv', new THREE.BufferAttribute(r.uv, 2));
-    g.setIndex(new THREE.BufferAttribute(r.index, 1));
-    const lg = new THREE.BufferGeometry();
-    lg.setAttribute('position', new THREE.BufferAttribute(r.lp, 3));
-    lg.setAttribute('aSeed', new THREE.BufferAttribute(r.ls, 1));
-    if (!c.mesh) {
-      c.mesh = new THREE.Mesh(g, blockMat);
-      c.lines = new THREE.LineSegments(lg, lineMat);
-      c.mesh.matrixAutoUpdate = c.lines.matrixAutoUpdate = false;
-      scene.add(c.mesh, c.lines);
-    } else {
-      c.mesh.geometry.dispose(); c.mesh.geometry = g;
-      c.lines.geometry.dispose(); c.lines.geometry = lg;
-    }
-  };
-  const sync = () => apply(WC.meshChunk(c.cx, c.cz, args.self, args.px, args.nx, args.pz, args.nz));
-  if (pool) pool.exec('mesh', [args]).then(apply, sync);
+  const done = r => { inflight--; c.meshIn = false; meshQ.push({ c, r }); };
+  const sync = () => setTimeout(() => done(WC.meshChunk(c.cx, c.cz, args.self, args.px, args.nx, args.pz, args.nz)), 0);
+  if (pool) pool.exec('mesh', [args]).then(done, () => { poolFail(); sync(); });
   else sync();
+}
+
+// main-thread geometry build — budgeted from frame() via meshQ
+function applyMesh(c, r) {
+  if (store.get(ckey(c.cx, c.cz)) !== c || !c.vox || c.dirty) return;  // stale/unloaded
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(r.pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(r.nor, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(r.uv, 2));
+  g.setIndex(new THREE.BufferAttribute(r.index, 1));
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute('position', new THREE.BufferAttribute(r.lp, 3));
+  lg.setAttribute('aSeed', new THREE.BufferAttribute(r.ls, 1));
+  if (!c.mesh) {
+    c.mesh = new THREE.Mesh(g, blockMat);
+    c.lines = new THREE.LineSegments(lg, lineMat);
+    c.mesh.matrixAutoUpdate = c.lines.matrixAutoUpdate = false;
+    scene.add(c.mesh, c.lines);
+  } else {
+    c.mesh.geometry.dispose(); c.mesh.geometry = g;
+    c.lines.geometry.dispose(); c.lines.geometry = lg;
+  }
 }
 
 function unload(c) {
@@ -837,6 +852,10 @@ const frame = () => {
   const dt = Math.min(clock.getDelta(), 0.05);
   timeU.value += dt;
   updateChunks();
+  for (let i = 0; i < MAXAPPLY && meshQ.length; i++) {
+    const m = meshQ.shift();
+    applyMesh(m.c, m.r);
+  }
   step(dt);
   updateAim();
   for (const s of clouds) {
@@ -847,4 +866,4 @@ const frame = () => {
 };
 renderer.setAnimationLoop(frame);
 
-window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned, frame };
+window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned, frame, pool: () => pool };
