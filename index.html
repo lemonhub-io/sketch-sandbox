@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Sketch Sandbox</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="crosshair"><i></i><i></i></div>
+
+  <div id="hotbar"></div>
+
+  <div id="hint">WASD walk &nbsp;·&nbsp; Space jump &nbsp;·&nbsp; F fly &nbsp;·&nbsp; LMB dig &nbsp;·&nbsp; RMB place</div>
+
+  <div id="overlay">
+    <div class="card">
+      <h1>Sketch Sandbox</h1>
+      <p class="sub">a tiny hand-drawn world</p>
+      <ul>
+        <li><b>W A S D</b> walk &nbsp; <b>Space</b> jump &nbsp; <b>F</b> fly</li>
+        <li><b>Left click</b> dig &nbsp; <b>Right click</b> place</li>
+        <li><b>1–8</b> or <b>scroll</b> pick a block</li>
+        <li><b>Middle click</b> pick what you aim at</li>
+        <li><b>Esc</b> let the mouse go</li>
+      </ul>
+      <button id="play">click to draw yourself in</button>
+    </div>
+  </div>
+
+  <div id="grain"></div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
