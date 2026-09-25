@@ -641,6 +641,7 @@ function select(i) {
 select(0);
 
 let touchMode = false;
+let unlockAt = -1e9;   // last pointer-lock exit, to spot Esc-cooldown rejections
 const tui = document.getElementById('touchui');
 
 function startTouch() {
@@ -653,26 +654,46 @@ function startTouch() {
   tui.style.display = 'block';
 }
 
-// pointerdown decides the input path: touch -> touch mode, mouse -> pointer lock
-overlay.addEventListener('pointerdown', e => {
-  if (e.pointerType === 'mouse') renderer.domElement.requestPointerLock();
-  else startTouch();
-});
-overlay.addEventListener('click', e => { if (!e.detail) renderer.domElement.requestPointerLock(); });
-renderer.domElement.addEventListener('click', () => {
-  if (!locked && !touchMode) renderer.domElement.requestPointerLock();
-});
+// pointer lock unavailable/denied -> still get in, with drag-look + buttons
+function failSafe() {
+  if (locked || touchMode) return;
+  if (document.pointerLockElement || document.webkitPointerLockElement) return;
+  if (performance.now() - unlockAt < 1600) return;  // Esc cooldown: stay on menu
+  startTouch();
+}
+
+function enter(viaTouch) {
+  if (locked || touchMode) return;
+  if (viaTouch) return startTouch();
+  const el = renderer.domElement;
+  const req = (el.requestPointerLock || el.webkitRequestPointerLock || el.mozRequestPointerLock)?.bind(el);
+  if (!req) return startTouch();
+  try {
+    const r = req();
+    if (r && r.catch) r.catch(() => failSafe());
+    setTimeout(failSafe, 1200);                       // backstop for silent failures
+  } catch { failSafe(); }
+}
+
+overlay.addEventListener('pointerdown', e => enter(e.pointerType !== 'mouse'));
+overlay.addEventListener('click', () => enter(false));   // keyboard / no-PointerEvent browsers
+renderer.domElement.addEventListener('click', () => enter(false));
 
 if (matchMedia('(pointer: coarse)').matches)
   document.getElementById('play').textContent = 'tap to draw yourself in';
 
-document.addEventListener('pointerlockchange', () => {
-  locked = document.pointerLockElement === renderer.domElement;
+function onLockChange() {
+  locked = !!(document.pointerLockElement || document.webkitPointerLockElement);
+  if (!locked) unlockAt = performance.now();
   overlay.style.display = locked ? 'none' : 'flex';
-  crosshair.style.display = locked ? 'block' : 'none';
-  hint.style.display = locked ? 'block' : 'none';
+  crosshair.style.display = locked || touchMode ? 'block' : 'none';
+  hint.style.display = locked || touchMode ? 'block' : 'none';
   if (locked) tui.style.display = 'none';
-});
+}
+document.addEventListener('pointerlockchange', onLockChange);
+document.addEventListener('webkitpointerlockchange', onLockChange);
+document.addEventListener('pointerlockerror', () => setTimeout(failSafe, 250));
+document.addEventListener('webkitpointerlockerror', () => setTimeout(failSafe, 250));
 
 addEventListener('mousemove', e => {
   if (!locked) return;
@@ -725,7 +746,7 @@ stick.addEventListener('pointercancel', joyEnd);
 // look-drag on the canvas; a quick tap = dig
 let lookId = null, lx = 0, ly = 0, tapX = 0, tapY = 0, tapT = 0;
 renderer.domElement.addEventListener('pointerdown', e => {
-  if (!touchMode || e.pointerType === 'mouse' || lookId !== null) return;
+  if (!touchMode || locked || lookId !== null) return;
   lookId = e.pointerId;
   lx = tapX = e.clientX; ly = tapY = e.clientY;
   tapT = performance.now();
