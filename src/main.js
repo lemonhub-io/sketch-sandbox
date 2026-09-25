@@ -479,6 +479,75 @@ const highlight = new THREE.LineSegments(hlGeo, lineMat);
 highlight.visible = false;
 scene.add(highlight);
 
+/* ------- pencil-dash particles: dig/place bursts ------- */
+
+const PN = 96;
+const pGeo = new THREE.BufferGeometry();
+const pPos = new Float32Array(PN * 6);          // one 2-vert dash per particle
+const pCol = new Float32Array(PN * 6);
+pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
+const pMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 });
+addWobble(pMat, 0.05);
+const plines = new THREE.LineSegments(pGeo, pMat);
+plines.frustumCulled = false;
+plines.renderOrder = 2;
+scene.add(plines);
+
+const parts = new Array(PN).fill(null);          // {vx,vy,vz, life, ttl}
+const INKCOLS = {                                // dust tint per block dug
+  [B.GRASS]: 0x5c7a40, [B.DIRT]: 0x71543a, [B.STONE]: 0x7c7c88,
+  [B.LOG]: 0x71543a,   [B.LEAF]: 0x4f7434, [B.SAND]: 0xbfa160,
+  [B.PLANK]: 0xa8834f, [B.BRICK]: 0x9a5540,
+};
+const _pc = new THREE.Color();
+
+function burst(x, y, z, bid, n = 10) {
+  _pc.setHex(INKCOLS[bid] || 0x3a3026);
+  let made = 0;
+  for (let i = 0; i < PN && made < n; i++) {
+    if (parts[i] && parts[i].life < parts[i].ttl) continue;
+    const o = i * 6;
+    const px = x + Math.random(), py = y + Math.random(), pz = z + Math.random();
+    const dx = Math.random() - 0.5, dy = Math.random() - 0.5, dz = Math.random() - 0.5;
+    const dl = Math.hypot(dx, dy, dz) || 1, hl = 0.05 + Math.random() * 0.07;
+    pPos[o]     = px - dx / dl * hl; pPos[o + 1] = py - dy / dl * hl; pPos[o + 2] = pz - dz / dl * hl;
+    pPos[o + 3] = px + dx / dl * hl; pPos[o + 4] = py + dy / dl * hl; pPos[o + 5] = pz + dz / dl * hl;
+    pCol[o] = pCol[o + 3] = _pc.r; pCol[o + 1] = pCol[o + 4] = _pc.g; pCol[o + 2] = pCol[o + 5] = _pc.b;
+    parts[i] = {
+      vx: (Math.random() - 0.5) * 3.6,
+      vy: Math.random() * 3.4 + 1.4,
+      vz: (Math.random() - 0.5) * 3.6,
+      life: 0, ttl: 0.32 + Math.random() * 0.28,
+    };
+    made++;
+  }
+  pGeo.attributes.color.needsUpdate = true;
+}
+
+function stepParts(dt) {
+  let any = false;
+  for (let i = 0; i < PN; i++) {
+    const s = parts[i];
+    if (!s) continue;
+    if (s.life >= s.ttl) {                       // parked dead
+      if (pPos[i * 6 + 1] > -900) { pPos[i * 6 + 1] = pPos[i * 6 + 4] = -999; any = true; }
+      continue;
+    }
+    any = true;
+    s.life += dt;
+    s.vy -= 17 * dt;
+    const o = i * 6;
+    for (let k = 0; k < 2; k++) {
+      pPos[o + k * 3] += s.vx * dt;
+      pPos[o + k * 3 + 1] += s.vy * dt;
+      pPos[o + k * 3 + 2] += s.vz * dt;
+    }
+    if (s.life >= s.ttl) { pPos[o + 1] = pPos[o + 4] = -999; }
+  }
+  if (any) pGeo.attributes.position.needsUpdate = true;
+}
+
 /* ============================== player ============================== */
 
 const p = new THREE.Vector3(0.5, H + 4, 0.5);   // feet position (hovering until spawn chunk arrives)
@@ -495,20 +564,28 @@ function ensureSpawn() {
   let y = H - 1;
   while (y > 0 && !get(0, y, 0)) y--;
   p.set(0.5, y + 1.01, 0.5);
+  if (!welcomed) { welcomed = true; toast('you have been drawn in'); }
 }
+let welcomed = false;
 
 const keys = {};
 const joy = { x: 0, y: 0 };                 // analog stick vector, -1..1
-const isActive = () => locked || touchMode;
+const isActive = () => screen === 'play' && (locked || touchMode);
 
 function toggleFly() {
   fly = !fly; v.y = 0;
   document.body.classList.toggle('fly', fly);
+  toast(fly ? 'flying — Space up · Shift down' : 'walking');
+  sfx('fly');
 }
 
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'KeyF' && isActive()) toggleFly();
+  if (e.code === 'KeyM') setSound(!soundOn);
+  if (e.code === 'Enter' && screen !== 'play') {   // Enter starts / resumes
+    if (screen === 'pause' && touchMode) setScreen('play'); else enter(false);
+  }
   if (e.code.startsWith('Digit')) {
     const n = +e.code.slice(5);
     if (n >= 1 && n <= PALETTE.length) select(n - 1);
@@ -558,15 +635,17 @@ function step(dt) {
   } else {
     v.y -= 24 * dt;
     if (v.y < -42) v.y = -42;
-    if (keys.Space && onGround) { v.y = 8.6; onGround = false; }
+    if (keys.Space && onGround) { v.y = 8.6; onGround = false; sfx('jump'); }
   }
 
+  const vyBefore = v.y;
   onGround = false;
   sweep('x', v.x * dt);
   sweep('z', v.z * dt);
   sweep('y', v.y * dt);
+  if (onGround && vyBefore < -11) { sfx('thud'); burst(p.x, p.y + 0.05, p.z, B.DIRT, 6); }
 
-  if (p.y < -14) { p.set(0.5, H + 4, 0.5); v.set(0, 0, 0); spawned = false; ensureSpawn(); }
+  if (p.y < -14) { p.set(0.5, H + 4, 0.5); v.set(0, 0, 0); spawned = false; ensureSpawn(); toast('back to the page'); }
 }
 
 /* ============================== digging / placing ============================== */
@@ -591,17 +670,57 @@ function raycast(o, d, maxD) {
   return null;
 }
 
-let AC;
-function blip(f) {
+/* ------- tiny procedural sfx (WebAudio, no assets) ------- */
+let AC = null, noiseBuf = null;
+let soundOn = true;
+
+function audio() {
+  if (!soundOn) return null;
   try {
     AC = AC || new (window.AudioContext || window.webkitAudioContext)();
-    const o = AC.createOscillator(), g = AC.createGain();
-    o.type = 'triangle'; o.frequency.value = f;
-    g.gain.setValueAtTime(0.06, AC.currentTime);
-    g.gain.exponentialRampToValueAtTime(1e-4, AC.currentTime + 0.08);
-    o.connect(g).connect(AC.destination);
-    o.start(); o.stop(AC.currentTime + 0.09);
-  } catch (_) {}
+    if (AC.state === 'suspended') AC.resume();
+    if (!noiseBuf) {
+      noiseBuf = AC.createBuffer(1, AC.sampleRate * 0.12 | 0, AC.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    return AC;
+  } catch (_) { return null; }
+}
+
+function blip(f, dur = 0.08, type = 'triangle', vol = 0.06, slide = 0) {
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.value = f;
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, f + slide), ac.currentTime + dur);
+  g.gain.setValueAtTime(vol, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(1e-4, ac.currentTime + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(); o.stop(ac.currentTime + dur + 0.01);
+}
+
+function scratch(dur = 0.09, vol = 0.1, freq = 800) {
+  const ac = audio(); if (!ac) return;
+  const s = ac.createBufferSource(); s.buffer = noiseBuf;
+  const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = 0.9;
+  const g = ac.createGain();
+  g.gain.setValueAtTime(vol, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(1e-4, ac.currentTime + dur);
+  s.connect(f).connect(g).connect(ac.destination);
+  s.start(); s.stop(ac.currentTime + dur + 0.01);
+}
+
+function sfx(kind) {
+  switch (kind) {
+    case 'dig':   scratch(0.09, 0.13, 650); blip(140, 0.08, 'triangle', 0.06, -50); break;
+    case 'place': blip(520, 0.07, 'triangle', 0.07); break;
+    case 'pick':  blip(660, 0.05, 'sine', 0.05); break;
+    case 'ui':    blip(780, 0.05, 'sine', 0.035); break;
+    case 'jump':  blip(310, 0.07, 'sine', 0.04, 140); break;
+    case 'fly':   blip(430, 0.1, 'sine', 0.05, 300); break;
+    case 'thud':  blip(85, 0.11, 'sine', 0.1, -25); scratch(0.06, 0.07, 300); break;
+    case 'ready': blip(392, 0.1, 'triangle', 0.05); setTimeout(() => blip(523, 0.16, 'triangle', 0.045), 90); break;
+  }
 }
 
 let selected = 0;
@@ -618,8 +737,10 @@ function updateAim() {
 
 function dig() {
   if (!aim) return;
+  const bid = get(aim.x, aim.y, aim.z);
   edit(aim.x, aim.y, aim.z, 0);
-  blip(190);
+  burst(aim.x, aim.y, aim.z, bid, 12);
+  sfx('dig');
 }
 
 function place() {
@@ -627,22 +748,85 @@ function place() {
   const x = aim.x + aim.nx, y = aim.y + aim.ny, z = aim.z + aim.nz;
   if (!inB(x, y, z) || blockAtPlayer(x, y, z)) return;
   edit(x, y, z, PALETTE[selected]);
-  blip(520);
+  burst(x, y, z, PALETTE[selected], 5);
+  sfx('place');
 }
 
 function pick() {
   if (!aim) return;
   const i = PALETTE.indexOf(get(aim.x, aim.y, aim.z));
-  if (i >= 0) select(i);
+  if (i >= 0) { select(i); sfx('pick'); }
 }
 
 /* ============================== input / HUD ============================== */
 
 const overlay = document.getElementById('overlay');
+const pauseEl = document.getElementById('pause');
 const crosshair = document.getElementById('crosshair');
 const hint = document.getElementById('hint');
 const hotbar = document.getElementById('hotbar');
+const toastsEl = document.getElementById('toasts');
+const pickname = document.getElementById('pickname');
+const loadwrap = document.getElementById('loadbar');
+const loadfill = document.querySelector('#loadbar i');
+const loadmsg = document.getElementById('loadmsg');
 let locked = false;
+
+/* ------- screen state machine: menu -> play -> pause ------- */
+let screen = 'menu';
+
+function setScreen(s) {
+  screen = s;
+  overlay.style.display = s === 'menu' ? 'flex' : 'none';
+  pauseEl.style.display = s === 'pause' ? 'flex' : 'none';
+  const playing = s === 'play';
+  crosshair.style.display = playing ? 'block' : 'none';
+  hint.style.display = playing ? 'block' : 'none';
+  tui.style.display = playing && touchMode ? 'block' : 'none';
+  if (!playing) {                                // drop held input so nothing sticks
+    for (const k in keys) keys[k] = false;
+    joy.x = joy.y = 0; stickId = lookId = null; nub.style.transform = '';
+  }
+  if (playing) {                                 // hint fades once you've settled in
+    hint.style.opacity = '';
+    clearTimeout(hintT);
+    hintT = setTimeout(() => hint.style.opacity = '.35', 9000);
+  }
+}
+let hintT = 0;
+
+function toast(msg, ms = 1700) {
+  while (toastsEl.children.length > 3) toastsEl.firstChild.remove();
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  toastsEl.appendChild(t);
+  setTimeout(() => t.classList.add('out'), ms - 400);
+  setTimeout(() => t.remove(), ms);
+}
+
+/* ------- settings (persisted) ------- */
+const cfg = (() => { try { return JSON.parse(localStorage.getItem('ssb_cfg')) || {}; } catch (_) { return {}; } })();
+let sens = typeof cfg.sens === 'number' ? cfg.sens : 1;
+soundOn = cfg.sound !== false;
+const saveCfg = () => { try { localStorage.setItem('ssb_cfg', JSON.stringify({ sens, sound: soundOn })); } catch (_) {} };
+
+const sensEl = document.getElementById('sens');
+const sensv = document.getElementById('sensv');
+const soundEl = document.getElementById('sound');
+function syncSettings() {
+  sensEl.value = sens;
+  sensv.textContent = sens.toFixed(1) + '×';
+  soundEl.textContent = soundOn ? 'on' : 'off';
+  soundEl.classList.toggle('off', !soundOn);
+}
+syncSettings();
+sensEl.addEventListener('input', () => { sens = +sensEl.value; sensv.textContent = sens.toFixed(1) + '×'; saveCfg(); });
+function setSound(on) {
+  soundOn = on; saveCfg(); syncSettings();
+  if (on) sfx('ui');
+  toast('sound ' + (on ? 'on' : 'off'));
+}
+soundEl.addEventListener('click', e => { e.stopPropagation(); setSound(!soundOn); });
 
 PALETTE.forEach((b, i) => {
   const slot = document.createElement('div');
@@ -663,6 +847,12 @@ PALETTE.forEach((b, i) => {
 function select(i) {
   selected = i;
   [...hotbar.children].forEach((s, k) => s.classList.toggle('sel', k === i));
+  if (screen === 'play') {                       // flash the block name above the hotbar
+    pickname.textContent = BLOCKS[PALETTE[i]].n;
+    pickname.classList.remove('show');
+    void pickname.offsetWidth;
+    pickname.classList.add('show');
+  }
 }
 select(0);
 
@@ -673,11 +863,8 @@ const tui = document.getElementById('touchui');
 function startTouch() {
   touchMode = true;
   document.body.classList.add('touch');
-  overlay.style.display = 'none';
-  crosshair.style.display = 'block';
-  hint.style.display = 'block';
   hint.textContent = 'drag to look · stick walks · tap a block to dig';
-  tui.style.display = 'block';
+  setScreen('play');
 }
 
 // pointer lock unavailable/denied -> still get in, with drag-look + buttons
@@ -690,6 +877,7 @@ function failSafe() {
 
 function enter(viaTouch) {
   if (locked || touchMode) return;
+  sfx('ui');                                     // also unlocks AudioContext on this gesture
   if (viaTouch) return startTouch();
   const el = renderer.domElement;
   const req = (el.requestPointerLock || el.webkitRequestPointerLock || el.mozRequestPointerLock)?.bind(el);
@@ -711,10 +899,8 @@ if (matchMedia('(pointer: coarse)').matches)
 function onLockChange() {
   locked = !!(document.pointerLockElement || document.webkitPointerLockElement);
   if (!locked) unlockAt = performance.now();
-  overlay.style.display = locked ? 'none' : 'flex';
-  crosshair.style.display = locked || touchMode ? 'block' : 'none';
-  hint.style.display = locked || touchMode ? 'block' : 'none';
-  if (locked) tui.style.display = 'none';
+  if (locked) setScreen('play');
+  else if (screen === 'play' && !touchMode) setScreen('pause');   // Esc -> pause card
 }
 document.addEventListener('pointerlockchange', onLockChange);
 document.addEventListener('webkitpointerlockchange', onLockChange);
@@ -723,8 +909,8 @@ document.addEventListener('webkitpointerlockerror', () => setTimeout(failSafe, 2
 
 addEventListener('mousemove', e => {
   if (!locked) return;
-  yaw -= e.movementX * 0.0022;
-  pitch = Math.max(-1.55, Math.min(1.55, pitch - e.movementY * 0.0022));
+  yaw -= e.movementX * 0.0022 * sens;
+  pitch = Math.max(-1.55, Math.min(1.55, pitch - e.movementY * 0.0022 * sens));
 });
 
 addEventListener('mousedown', e => {
@@ -779,8 +965,8 @@ renderer.domElement.addEventListener('pointerdown', e => {
 });
 addEventListener('pointermove', e => {
   if (e.pointerId !== lookId) return;
-  yaw -= (e.clientX - lx) * 0.0055;
-  pitch = Math.max(-1.55, Math.min(1.55, pitch - (e.clientY - ly) * 0.0055));
+  yaw -= (e.clientX - lx) * 0.0055 * sens;
+  pitch = Math.max(-1.55, Math.min(1.55, pitch - (e.clientY - ly) * 0.0055 * sens));
   lx = e.clientX; ly = e.clientY;
 });
 const endLook = e => {
@@ -822,7 +1008,14 @@ document.getElementById('t-fly').addEventListener('pointerdown', e => {
 });
 document.getElementById('t-menu').addEventListener('pointerdown', e => {
   e.preventDefault();
-  overlay.style.display = 'flex';
+  sfx('ui');
+  setScreen('pause');
+});
+document.getElementById('resume').addEventListener('click', e => {
+  e.stopPropagation();
+  sfx('ui');
+  if (touchMode) setScreen('play');
+  else enter(false);
 });
 
 addEventListener('resize', () => {
@@ -847,16 +1040,35 @@ addEventListener('resize', () => {
 
 /* ============================== loop ============================== */
 
+// start-card progress: how much of the visible world has been sketched
+let lastPct = -1, lastMsg = '';
+function updateLoad() {
+  if (screen !== 'menu') return;
+  let meshed = 0;
+  for (const c of store.values()) if (c.mesh) meshed++;
+  const total = store.size || 1;
+  const pct = Math.min(100, Math.round(meshed / total * 100));
+  if (pct !== lastPct) { lastPct = pct; loadfill.style.width = pct + '%'; }
+  const ready = spawned && meshed >= total;
+  const msg = ready ? 'the world is drawn — come on in'
+            : spawned ? 'a few more strokes…'
+            : `sketching the world… ${pct}%`;
+  if (msg !== lastMsg) { lastMsg = msg; loadmsg.textContent = msg; }
+  loadwrap.classList.toggle('full', ready);
+}
+
 const clock = new THREE.Clock();
 const frame = () => {
   const dt = Math.min(clock.getDelta(), 0.05);
   timeU.value += dt;
   updateChunks();
+  updateLoad();
   for (let i = 0; i < MAXAPPLY && meshQ.length; i++) {
     const m = meshQ.shift();
     applyMesh(m.c, m.r);
   }
   step(dt);
+  stepParts(dt);
   updateAim();
   for (const s of clouds) {
     s.position.x += s.userData.v * dt;
@@ -866,4 +1078,4 @@ const frame = () => {
 };
 renderer.setAnimationLoop(frame);
 
-window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned, frame, pool: () => pool };
+window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned, frame, pool: () => pool, screen: () => screen, parts, dig };

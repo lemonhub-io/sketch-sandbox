@@ -15,19 +15,45 @@
   <div id="hotbar"></div>
 
   <div id="hint">WASD walk &nbsp;·&nbsp; Space jump &nbsp;·&nbsp; F fly &nbsp;·&nbsp; LMB dig &nbsp;·&nbsp; RMB place</div>
+  <div id="pickname"></div>
+  <div id="toasts"></div>
 
   <div id="overlay">
     <div class="card">
       <h1>Sketch Sandbox</h1>
       <p class="sub">a tiny hand-drawn world</p>
+      <div id="loadbar"><i></i></div>
+      <p id="loadmsg">sketching the world…</p>
       <ul>
         <li><b>W A S D</b> walk &nbsp; <b>Space</b> jump &nbsp; <b>F</b> fly</li>
         <li><b>Left click</b> dig &nbsp; <b>Right click</b> place</li>
         <li><b>1–8</b> or <b>scroll</b> pick a block</li>
         <li><b>Middle click</b> pick what you aim at</li>
-        <li><b>Esc</b> let the mouse go</li>
+        <li><b>Esc</b> pause &nbsp; <b>M</b> mute</li>
       </ul>
       <button id="play">click to draw yourself in</button>
+    </div>
+  </div>
+
+  <div id="pause">
+    <div class="card">
+      <h1>paused</h1>
+      <p class="sub">the world holds its breath</p>
+      <div class="setrow">
+        <label for="sens">look speed</label>
+        <input id="sens" type="range" min="0.4" max="2.4" step="0.1">
+        <span id="sensv">1.0×</span>
+      </div>
+      <div class="setrow">
+        <label for="sound">sound</label>
+        <button id="sound" class="tog">on</button>
+      </div>
+      <ul>
+        <li><b>W A S D</b> walk &nbsp; <b>Space</b> jump &nbsp; <b>F</b> fly</li>
+        <li><b>Left click</b> dig &nbsp; <b>Right click</b> place</li>
+        <li><b>1–8</b> / <b>scroll</b> pick &nbsp; <b>Middle click</b> copy block</li>
+      </ul>
+      <button id="resume">back to the world</button>
     </div>
   </div>
 
