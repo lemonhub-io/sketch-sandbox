@@ -7,6 +7,9 @@ html, body {
   font-family: 'Segoe Print', 'Bradley Hand', 'Comic Sans MS', 'Chalkboard SE', cursive;
   user-select: none;
   -webkit-user-select: none;
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 #app, #app canvas { position: fixed; inset: 0; display: block; }
@@ -30,7 +33,7 @@ html, body {
   position: fixed; left: 50%; bottom: 18px;
   transform: translateX(-50%) rotate(-.4deg);
   display: flex; gap: 7px;
-  pointer-events: none;
+  pointer-events: auto;
 }
 .slot {
   width: 54px; height: 58px;
@@ -110,6 +113,76 @@ html, body {
 }
 #play:hover { background: #fffdf2; transform: rotate(.7deg) translateY(-1px); }
 #play:active { transform: rotate(.7deg) translateY(2px); box-shadow: 0 1px 0 rgba(58,48,38,.3); }
+
+#overlay { z-index: 40; }
+
+/* ---- touch controls ---- */
+#touchui {
+  position: fixed; inset: 0;
+  display: none;
+  pointer-events: none;
+  z-index: 30;
+}
+
+#stick {
+  position: absolute; left: 24px; bottom: 104px;
+  width: 116px; height: 116px;
+  border: 2.5px solid rgba(58,48,38,.55);
+  border-radius: 50% 47% 52% 49% / 49% 52% 47% 51%;
+  background: rgba(246,239,221,.5);
+  pointer-events: auto;
+  touch-action: none;
+}
+#nub {
+  position: absolute; left: 50%; top: 50%;
+  width: 46px; height: 46px; margin: -23px;
+  border-radius: 49% 51% 48% 52% / 52% 48% 51% 49%;
+  background: rgba(58,48,38,.55);
+  box-shadow: 1px 2px 0 rgba(58,48,38,.3);
+}
+
+.tbtns {
+  position: absolute; right: 18px; bottom: 100px;
+  display: grid;
+  grid-template-columns: repeat(2, auto);
+  gap: 10px;
+  pointer-events: none;
+}
+.tbtn {
+  pointer-events: auto;
+  touch-action: none;
+  font-family: inherit;
+  font-size: 16px;
+  padding: 9px 16px;
+  min-width: 62px;
+  border: 2.5px solid #4a4034;
+  background: rgba(246,239,221,.92);
+  border-radius: 13px 5px 15px 6px / 6px 15px 5px 13px;
+  box-shadow: 2px 3px 0 rgba(58,48,38,.3);
+  color: #3e352a;
+  transform: rotate(.5deg);
+}
+.tbtn:nth-child(even) { transform: rotate(-.8deg); }
+.tbtn:active { transform: translateY(2px); box-shadow: 0 1px 0 rgba(58,48,38,.3); }
+.tbtn.big { grid-column: 1 / -1; font-size: 19px; padding: 12px; }
+body.fly #t-fly { background: #d9c98f; }
+#t-down { visibility: hidden; }
+body.fly #t-down { visibility: visible; }
+
+#t-menu {
+  position: absolute; top: 14px; right: 14px;
+  font-size: 14px; padding: 6px 14px;
+}
+
+/* tighter HUD on small touch screens */
+body.touch #hotbar { bottom: 8px; gap: 5px; }
+body.touch .slot { width: 40px; height: 46px; font-size: 8px; }
+body.touch .slot canvas { width: 25px; height: 25px; }
+body.touch #hint {
+  top: 10px; bottom: auto; left: 50%; right: auto;
+  transform: translateX(-50%) rotate(-.6deg);
+  font-size: 11px; white-space: nowrap;
+}
 
 /* ---- paper grain over everything ---- */
 #grain {

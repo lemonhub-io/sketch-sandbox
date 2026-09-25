@@ -474,14 +474,22 @@ let yaw = -0.6, pitch = -0.15, onGround = false, fly = false;
 }
 
 const keys = {};
+const joy = { x: 0, y: 0 };                 // analog stick vector, -1..1
+const isActive = () => locked || touchMode;
+
+function toggleFly() {
+  fly = !fly; v.y = 0;
+  document.body.classList.toggle('fly', fly);
+}
+
 addEventListener('keydown', e => {
   keys[e.code] = true;
-  if (e.code === 'KeyF' && locked) { fly = !fly; v.y = 0; }
+  if (e.code === 'KeyF' && isActive()) toggleFly();
   if (e.code.startsWith('Digit')) {
     const n = +e.code.slice(5);
     if (n >= 1 && n <= PALETTE.length) select(n - 1);
   }
-  if (locked && ['Space','KeyW','KeyA','KeyS','KeyD'].includes(e.code)) e.preventDefault();
+  if (isActive() && ['Space','KeyW','KeyA','KeyS','KeyD'].includes(e.code)) e.preventDefault();
 });
 addEventListener('keyup', e => keys[e.code] = false);
 
@@ -506,13 +514,14 @@ const blockAtPlayer = (bx, by, bz) =>
   bz + 1 > p.z - PR && bz < p.z + PR;
 
 function step(dt) {
-  const fw = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-  const st = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  const fw = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0) + joy.y;
+  const st = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) + joy.x;
   const sy = Math.sin(yaw), cy = Math.cos(yaw);
   let tx = (-sy * fw + cy * st), tz = (-cy * fw - sy * st);
-  const l = Math.hypot(tx, tz) || 1;
+  const l = Math.hypot(tx, tz);
+  if (l > 1) { tx /= l; tz /= l; }          // clamp, keep analog tilt
   const speed = fly ? 9 : 4.6;
-  tx = tx / l * speed; tz = tz / l * speed;
+  tx *= speed; tz *= speed;
   const k = Math.min(1, dt * (fly || onGround ? 11 : 3.5));
   v.x += (tx - v.x) * k; v.z += (tz - v.z) * k;
 
@@ -622,6 +631,7 @@ PALETTE.forEach((b, i) => {
   const name = document.createElement('span');
   name.textContent = BLOCKS[b].n;
   slot.append(key, icon, name);
+  slot.addEventListener('pointerdown', e => { e.preventDefault(); select(i); });
   hotbar.appendChild(slot);
 });
 function select(i) {
@@ -630,20 +640,38 @@ function select(i) {
 }
 select(0);
 
+let touchMode = false;
+const tui = document.getElementById('touchui');
+
+function startTouch() {
+  touchMode = true;
+  document.body.classList.add('touch');
+  overlay.style.display = 'none';
+  crosshair.style.display = 'block';
+  hint.style.display = 'block';
+  hint.textContent = 'drag to look · stick walks · tap a block to dig';
+  tui.style.display = 'block';
+}
+
+// pointerdown decides the input path: touch -> touch mode, mouse -> pointer lock
+overlay.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'mouse') renderer.domElement.requestPointerLock();
+  else startTouch();
+});
+overlay.addEventListener('click', e => { if (!e.detail) renderer.domElement.requestPointerLock(); });
 renderer.domElement.addEventListener('click', () => {
-  if (!locked) renderer.domElement.requestPointerLock();
+  if (!locked && !touchMode) renderer.domElement.requestPointerLock();
 });
-overlay.addEventListener('click', () => renderer.domElement.requestPointerLock());
-document.getElementById('play').addEventListener('click', e => {
-  e.stopPropagation();
-  renderer.domElement.requestPointerLock();
-});
+
+if (matchMedia('(pointer: coarse)').matches)
+  document.getElementById('play').textContent = 'tap to draw yourself in';
 
 document.addEventListener('pointerlockchange', () => {
   locked = document.pointerLockElement === renderer.domElement;
   overlay.style.display = locked ? 'none' : 'flex';
   crosshair.style.display = locked ? 'block' : 'none';
   hint.style.display = locked ? 'block' : 'none';
+  if (locked) tui.style.display = 'none';
 });
 
 addEventListener('mousemove', e => {
@@ -663,6 +691,92 @@ addEventListener('wheel', e => {
   if (!locked) return;
   select((selected + (e.deltaY > 0 ? 1 : -1) + PALETTE.length) % PALETTE.length);
 }, { passive: true });
+
+/* ============================== touch controls ============================== */
+
+const stick = document.getElementById('stick');
+const nub = document.getElementById('nub');
+let stickId = null;
+
+function joyMove(e) {
+  const r = stick.getBoundingClientRect();
+  let dx = (e.clientX - (r.left + r.width / 2)) / 38;
+  let dy = (e.clientY - (r.top + r.height / 2)) / 38;
+  const l = Math.hypot(dx, dy);
+  if (l > 1) { dx /= l; dy /= l; }
+  joy.x = dx; joy.y = -dy;
+  nub.style.transform = `translate(${dx * 34}px, ${dy * 34}px)`;
+}
+stick.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  stickId = e.pointerId;
+  stick.setPointerCapture(stickId);
+  joyMove(e);
+});
+stick.addEventListener('pointermove', e => { if (e.pointerId === stickId) joyMove(e); });
+const joyEnd = e => {
+  if (e.pointerId !== stickId) return;
+  stickId = null; joy.x = joy.y = 0;
+  nub.style.transform = '';
+};
+stick.addEventListener('pointerup', joyEnd);
+stick.addEventListener('pointercancel', joyEnd);
+
+// look-drag on the canvas; a quick tap = dig
+let lookId = null, lx = 0, ly = 0, tapX = 0, tapY = 0, tapT = 0;
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (!touchMode || e.pointerType === 'mouse' || lookId !== null) return;
+  lookId = e.pointerId;
+  lx = tapX = e.clientX; ly = tapY = e.clientY;
+  tapT = performance.now();
+});
+addEventListener('pointermove', e => {
+  if (e.pointerId !== lookId) return;
+  yaw -= (e.clientX - lx) * 0.0055;
+  pitch = Math.max(-1.55, Math.min(1.55, pitch - (e.clientY - ly) * 0.0055));
+  lx = e.clientX; ly = e.clientY;
+});
+const endLook = e => {
+  if (e.pointerId !== lookId) return;
+  lookId = null;
+  const moved = Math.hypot(e.clientX - tapX, e.clientY - tapY);
+  if (moved < 9 && performance.now() - tapT < 300) dig();
+};
+addEventListener('pointerup', endLook);
+addEventListener('pointercancel', endLook);
+
+// holdable buttons (dig/put repeat while held; hop/down hold a key)
+function holdKey(el, code) {
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault(); keys[code] = true;
+    el.setPointerCapture(e.pointerId);
+  });
+  const up = () => keys[code] = false;
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+}
+function holdAction(el, fn) {
+  let iv = null;
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault(); fn();
+    iv = setInterval(fn, 240);
+    el.setPointerCapture(e.pointerId);
+  });
+  const up = () => { clearInterval(iv); iv = null; };
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+}
+holdKey(document.getElementById('t-jump'), 'Space');
+holdKey(document.getElementById('t-down'), 'ShiftLeft');
+holdAction(document.getElementById('t-dig'), dig);
+holdAction(document.getElementById('t-place'), place);
+document.getElementById('t-fly').addEventListener('pointerdown', e => {
+  e.preventDefault(); toggleFly();
+});
+document.getElementById('t-menu').addEventListener('pointerdown', e => {
+  e.preventDefault();
+  overlay.style.display = 'flex';
+});
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
