@@ -2,26 +2,10 @@ import * as THREE from './vendor/three.module.js';
 
 /* ============================== config ============================== */
 
-const W = 48, D = 48, H = 24;          // world size (x, z, y)
-const EYE = 1.62, PH = 1.8, PR = 0.3;  // eye height, player height, half-width
+const { H, CS, B, T, BLOCKS } = self.WC;    // shared world core (worldcore.js)
+const EYE = 1.62, PH = 1.8, PR = 0.3;       // eye height, player height, half-width
 const REACH = 6;
 
-const B = { GRASS: 1, DIRT: 2, STONE: 3, LOG: 4, LEAF: 5, SAND: 6, PLANK: 7, BRICK: 8 };
-
-// tile ids into the texture atlas
-const T = { GRASS_TOP: 0, GRASS_SIDE: 1, DIRT: 2, STONE: 3, LOG_SIDE: 4, LOG_TOP: 5, LEAF: 6, SAND: 7, PLANK: 8, BRICK: 9 };
-
-//             name          tiles: [top, bottom, sides]
-const BLOCKS = [null,
-  { n: 'Grass',  t: [T.GRASS_TOP, T.DIRT,  T.GRASS_SIDE] },
-  { n: 'Dirt',   t: [T.DIRT,      T.DIRT,  T.DIRT]      },
-  { n: 'Stone',  t: [T.STONE,     T.STONE, T.STONE]     },
-  { n: 'Log',    t: [T.LOG_TOP,   T.LOG_TOP, T.LOG_SIDE] },
-  { n: 'Leaf',   t: [T.LEAF,      T.LEAF,  T.LEAF]      },
-  { n: 'Sand',   t: [T.SAND,      T.SAND,  T.SAND]      },
-  { n: 'Plank',  t: [T.PLANK,     T.PLANK, T.PLANK]     },
-  { n: 'Brick',  t: [T.BRICK,     T.BRICK, T.BRICK]     },
-];
 const PALETTE = [B.GRASS, B.DIRT, B.STONE, B.LOG, B.PLANK, B.BRICK, B.SAND, B.LEAF];
 
 const INK = 'rgba(58,48,38,'; // pencil ink color prefix
@@ -236,58 +220,141 @@ atlasTex.colorSpace = THREE.SRGBColorSpace;
 atlasTex.magFilter = THREE.LinearFilter;
 atlasTex.minFilter = THREE.LinearMipmapLinearFilter;
 
-function tileUV(t) {  // [u0, v0, u1, v1] inset to avoid bleeding
-  const col = t % ATLAS, row = Math.floor(t / ATLAS);
-  const u0 = (col * TS + PAD) / (ATLAS * TS), u1 = ((col + 1) * TS - PAD) / (ATLAS * TS);
-  const v1 = 1 - (row * TS + PAD) / (ATLAS * TS), v0 = 1 - ((row + 1) * TS - PAD) / (ATLAS * TS);
-  return [u0, v0, u1, v1];
+/* ============================== infinite voxel world ==============================
+   Voxels live per-chunk (16x16 columns, full height). Terrain + meshing run
+   in a worker pool; the main thread keeps the voxel map for physics/raycast
+   and applies geometry results. Chunks stream in/out around the player. */
+
+const R = 4;                          // view radius in chunks
+const MAXTASKS = 8;                   // in-flight worker jobs cap
+const store = new Map();              // "cx,cz" -> {cx,cz,vox,mesh,lines,genIn,meshIn,dirty}
+const edits = new Map();              // "cx,cz" -> Map<lidx, block> (player edits, kept on unload)
+const ckey = (cx, cz) => cx + ',' + cz;
+const lidx = (x, y, z) => (x & (CS - 1)) + (z & (CS - 1)) * CS + y * CS * CS;
+
+const chunkAt = (x, z) => store.get(ckey(Math.floor(x / CS), Math.floor(z / CS)));
+
+const get = (x, y, z) => {
+  if (y < 0 || y >= H) return 0;
+  const c = chunkAt(x, z);
+  return c && c.vox ? c.vox[lidx(x, y, z)] : 0;
+};
+const inB = (x, y, z) => y >= 0 && y < H;
+// not-yet-loaded chunks act as walls so the player can't fall into the void
+const psolid = (x, y, z) => {
+  if (y < 0 || y >= H) return false;
+  const c = chunkAt(x, z);
+  return !c || !c.vox ? true : c.vox[lidx(x, y, z)] !== 0;
+};
+
+let pool = null;
+try { pool = self.workerpool.pool('worker.js', { minWorkers: 'max', maxWorkers: 4 }); } catch (e) {}
+let inflight = 0;
+
+function chunkState(cx, cz) {
+  const k = ckey(cx, cz);
+  let c = store.get(k);
+  if (!c) { c = { cx, cz, vox: null, mesh: null, lines: null, genIn: false, meshIn: false, dirty: false }; store.set(k, c); }
+  return c;
 }
 
-/* ============================== voxel world ============================== */
+function onVox(c, data) {
+  if (store.get(ckey(c.cx, c.cz)) !== c) return;      // unloaded meanwhile
+  c.vox = data;
+  c.dirty = true;
+  for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+    const n = store.get(ckey(c.cx + dx, c.cz + dz));
+    if (n && n.vox && n.mesh) n.dirty = true;          // its border faces changed
+  }
+  ensureSpawn();
+}
 
-const vox = new Uint8Array(W * D * H);
-const idx = (x, y, z) => x + z * W + y * W * D;
-const inB = (x, y, z) => x >= 0 && x < W && y >= 0 && y < H && z >= 0 && z < D;
-const get = (x, y, z) => inB(x, y, z) ? vox[idx(x, y, z)] : 0;
-const set = (x, y, z, b) => { if (inB(x, y, z)) vox[idx(x, y, z)] = b; };
-// walls around the arena for physics only
-const psolid = (x, y, z) => (x < 0 || x >= W || z < 0 || z >= D) ? y >= 0 && y < H + 8 : get(x, y, z) !== 0;
+function runGen(c) {
+  c.genIn = true; inflight++;
+  const e = edits.get(ckey(c.cx, c.cz));
+  const ed = e ? [...e] : null;
+  const done = data => { inflight--; c.genIn = false; onVox(c, data); };
+  if (pool) pool.exec('gen', [{ cx: c.cx, cz: c.cz, edits: ed }]).then(r => done(r.data), () => done(WC.genChunk(c.cx, c.cz, ed)));
+  else done(WC.genChunk(c.cx, c.cz, ed));
+}
 
-function genWorld() {
-  const r = rng(42);
-  const hmap = [];
-  for (let z = 0; z < D; z++) for (let x = 0; x < W; x++) {
-    const n = Math.sin(x * 0.31) * Math.cos(z * 0.28) * 1.7
-            + Math.sin(x * 0.11 + 2.1) * Math.cos(z * 0.13 + 1.3) * 2.6
-            + hash2(x, z) * 1.4;
-    const h = Math.max(1, Math.floor(5 + n));
-    hmap[x + z * W] = h;
-    for (let y = 0; y <= h; y++) {
-      let b = B.GRASS;
-      if (h <= 3) b = B.SAND;                  // low spots turn sandy
-      else if (y < h) b = y < h - 2 ? B.STONE : B.DIRT;
-      if (y === h && b === B.GRASS) set(x, y, z, B.GRASS);
-      else set(x, y, z, b === B.GRASS ? B.DIRT : b);
+function runMesh(c) {
+  c.meshIn = true; c.dirty = false; inflight++;
+  const nb = (dx, dz) => { const n = store.get(ckey(c.cx + dx, c.cz + dz)); return n ? n.vox : null; };
+  const args = { cx: c.cx, cz: c.cz, self: c.vox, px: nb(1, 0), nx: nb(-1, 0), pz: nb(0, 1), nz: nb(0, -1) };
+  const apply = r => {
+    inflight--; c.meshIn = false;
+    if (store.get(ckey(c.cx, c.cz)) !== c || !c.vox) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(r.pos, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(r.nor, 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(r.uv, 2));
+    g.setIndex(new THREE.BufferAttribute(r.index, 1));
+    const lg = new THREE.BufferGeometry();
+    lg.setAttribute('position', new THREE.BufferAttribute(r.lp, 3));
+    lg.setAttribute('aSeed', new THREE.BufferAttribute(r.ls, 1));
+    if (!c.mesh) {
+      c.mesh = new THREE.Mesh(g, blockMat);
+      c.lines = new THREE.LineSegments(lg, lineMat);
+      c.mesh.matrixAutoUpdate = c.lines.matrixAutoUpdate = false;
+      scene.add(c.mesh, c.lines);
+    } else {
+      c.mesh.geometry.dispose(); c.mesh.geometry = g;
+      c.lines.geometry.dispose(); c.lines.geometry = lg;
     }
-  }
-  // scribbled trees
-  for (let i = 0; i < 12; i++) {
-    const x = 3 + Math.floor(r() * (W - 6)), z = 3 + Math.floor(r() * (D - 6));
-    const h = hmap[x + z * W];
-    if (h <= 3 || get(x, h, z) !== B.GRASS) continue;
-    const th = h + 3 + Math.floor(r() * 2);
-    for (let y = h + 1; y <= th; y++) set(x, y, z, B.LOG);
-    for (let dy = -1; dy <= 1; dy++)
-      for (let dx = -2; dx <= 2; dx++)
-        for (let dz = -2; dz <= 2; dz++) {
-          if (Math.abs(dx) + Math.abs(dz) + Math.abs(dy) > 3) continue;
-          if (dx === 0 && dz === 0 && dy <= 0) continue;
-          if (get(x + dx, th + dy, z + dz) === 0) set(x + dx, th + dy, z + dz, B.LEAF);
-        }
-    set(x, th + 1, z, B.LEAF);
-  }
+  };
+  const sync = () => apply(WC.meshChunk(c.cx, c.cz, args.self, args.px, args.nx, args.pz, args.nz));
+  if (pool) pool.exec('mesh', [args]).then(apply, sync);
+  else sync();
 }
-genWorld();
+
+function unload(c) {
+  if (c.mesh) { scene.remove(c.mesh, c.lines); c.mesh.geometry.dispose(); c.lines.geometry.dispose(); }
+  store.delete(ckey(c.cx, c.cz));
+}
+
+let lastCX = null, lastCZ = null;
+function updateChunks() {
+  const pcx = Math.floor(p.x / CS), pcz = Math.floor(p.z / CS);
+  if (pcx !== lastCX || pcz !== lastCZ) {
+    lastCX = pcx; lastCZ = pcz;
+    for (let dz = -R; dz <= R; dz++)
+      for (let dx = -R; dx <= R; dx++)
+        chunkState(pcx + dx, pcz + dz);
+    for (const c of [...store.values()])
+      if (Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz)) > R + 1) unload(c);
+  }
+  const needGen = [], needMesh = [];
+  for (const c of store.values()) {
+    const d = Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz));
+    if (!c.vox && !c.genIn) needGen.push([d, c]);
+    else if (c.vox && c.dirty && !c.meshIn) needMesh.push([d, c]);
+  }
+  needGen.sort((a, b) => a[0] - b[0]);
+  needMesh.sort((a, b) => a[0] - b[0]);
+  for (const [, c] of needGen)  { if (inflight >= MAXTASKS) break; runGen(c); }
+  for (const [, c] of needMesh) { if (inflight >= MAXTASKS) break; runMesh(c); }
+}
+
+// set a voxel, persist the edit, and remesh the affected chunk(s)
+function edit(wx, wy, wz, b) {
+  const cx = Math.floor(wx / CS), cz = Math.floor(wz / CS);
+  const c = store.get(ckey(cx, cz));
+  if (!c || !c.vox) return;
+  const i = lidx(wx, wy, wz);
+  c.vox[i] = b;
+  const k = ckey(cx, cz);
+  let e = edits.get(k);
+  if (!e) edits.set(k, e = new Map());
+  e.set(i, b);
+  c.dirty = true;
+  const lx = wx - cx * CS, lz = wz - cz * CS;
+  const mark = (dx, dz) => { const n = store.get(ckey(cx + dx, cz + dz)); if (n && n.vox) n.dirty = true; };
+  if (lx === 0) mark(-1, 0);
+  if (lx === CS - 1) mark(1, 0);
+  if (lz === 0) mark(0, -1);
+  if (lz === CS - 1) mark(0, 1);
+}
 
 /* ============================== sketch materials ============================== */
 
@@ -315,101 +382,6 @@ const blockMat = new THREE.MeshLambertMaterial({ map: atlasTex });
 addWobble(blockMat, 0.03);
 const lineMat = new THREE.LineBasicMaterial({ color: 0x3a3026, transparent: true, opacity: 0.8 });
 addWobble(lineMat, 0.06);
-
-/* ============================== mesher ============================== */
-
-const FACES = [
-  { n: [ 1, 0, 0], c: [[1,0,1],[1,0,0],[1,1,0],[1,1,1]] },
-  { n: [-1, 0, 0], c: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]] },
-  { n: [ 0, 1, 0], c: [[0,1,1],[1,1,1],[1,1,0],[0,1,0]] },
-  { n: [ 0,-1, 0], c: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]] },
-  { n: [ 0, 0, 1], c: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]] },
-  { n: [ 0, 0,-1], c: [[1,0,0],[0,0,0],[0,1,0],[1,1,0]] },
-];
-
-/* the world is split into 16x16 column chunks: edits rebuild only the
-   affected chunk(s), and three.js frustum-culls offscreen chunks */
-
-const CS = 16;
-const CXN = Math.ceil(W / CS), CZN = Math.ceil(D / CS);
-const chunks = [];   // cx + cz * CXN -> { mesh, lines }
-
-function buildChunk(cx, cz) {
-  const pos = [], nor = [], uv = [], index = [];
-  const lp = [], ls = [];
-  const x0 = cx * CS, x1 = Math.min(x0 + CS, W);
-  const z0 = cz * CS, z1 = Math.min(z0 + CS, D);
-
-  for (let y = 0; y < H; y++) for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) {
-    const b = get(x, y, z);
-    if (!b) continue;
-    const def = BLOCKS[b];
-    for (let f = 0; f < 6; f++) {
-      const F = FACES[f];
-      if (get(x + F.n[0], y + F.n[1], z + F.n[2])) continue;   // hidden face
-      const tile = f === 2 ? def.t[0] : f === 3 ? def.t[1] : def.t[2];
-      const [u0, v0, u1, v1] = tileUV(tile);
-      const q0 = F.c[0], q1 = F.c[1], q2 = F.c[2], q3 = F.c[3];
-      const ax = x + q0[0], ay = y + q0[1], az = z + q0[2];
-      const bx = x + q1[0], by = y + q1[1], bz = z + q1[2];
-      const cxv = x + q2[0], cyv = y + q2[1], czv = z + q2[2];
-      const dx = x + q3[0], dy = y + q3[1], dz = z + q3[2];
-      pos.push(ax, ay, az, bx, by, bz, cxv, cyv, czv, dx, dy, dz);
-      for (let k = 0; k < 4; k++) nor.push(F.n[0], F.n[1], F.n[2]);
-      uv.push(u0, v0, u1, v0, u1, v1, u0, v1);
-      const base = pos.length / 3 - 4;
-      index.push(base, base + 1, base + 2, base, base + 2, base + 3);
-      // double sketch stroke per edge
-      lp.push(ax, ay, az, bx, by, bz);   ls.push(0, 0);
-      lp.push(ax, ay, az, bx, by, bz);   ls.push(1, 1);
-      lp.push(bx, by, bz, cxv, cyv, czv); ls.push(0, 0);
-      lp.push(bx, by, bz, cxv, cyv, czv); ls.push(1, 1);
-      lp.push(cxv, cyv, czv, dx, dy, dz); ls.push(0, 0);
-      lp.push(cxv, cyv, czv, dx, dy, dz); ls.push(1, 1);
-      lp.push(dx, dy, dz, ax, ay, az);   ls.push(0, 0);
-      lp.push(dx, dy, dz, ax, ay, az);   ls.push(1, 1);
-    }
-  }
-
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
-  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-  g.setIndex(index);
-
-  const lg = new THREE.BufferGeometry();
-  lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
-  lg.setAttribute('aSeed', new THREE.Float32BufferAttribute(ls, 1));
-
-  const i = cx + cz * CXN;
-  let ch = chunks[i];
-  if (!ch) {
-    chunks[i] = {
-      mesh: new THREE.Mesh(g, blockMat),
-      lines: new THREE.LineSegments(lg, lineMat),
-    };
-    scene.add(chunks[i].mesh, chunks[i].lines);
-  } else {
-    ch.mesh.geometry.dispose(); ch.mesh.geometry = g;
-    ch.lines.geometry.dispose(); ch.lines.geometry = lg;
-  }
-}
-
-function buildWorld() {
-  for (let cz = 0; cz < CZN; cz++) for (let cx = 0; cx < CXN; cx++) buildChunk(cx, cz);
-}
-
-// set a voxel and remesh the affected chunk(s), including border neighbors
-function edit(x, y, z, b) {
-  set(x, y, z, b);
-  const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
-  const dirty = [cx + cz * CXN];
-  if (x % CS === 0 && cx > 0) dirty.push(cx - 1 + cz * CXN);
-  if (x % CS === CS - 1 && cx < CXN - 1) dirty.push(cx + 1 + cz * CXN);
-  if (z % CS === 0 && cz > 0) dirty.push(cx + (cz - 1) * CXN);
-  if (z % CS === CS - 1 && cz < CZN - 1) dirty.push(cx + (cz + 1) * CXN);
-  for (const i of dirty) buildChunk(i % CXN, Math.floor(i / CXN));
-}
 
 /* ============================== scene ============================== */
 
@@ -492,17 +464,22 @@ const highlight = new THREE.LineSegments(hlGeo, lineMat);
 highlight.visible = false;
 scene.add(highlight);
 
-buildWorld();
-
 /* ============================== player ============================== */
 
-const p = new THREE.Vector3(W / 2, 20, D / 2);   // feet position
+const p = new THREE.Vector3(0.5, H + 4, 0.5);   // feet position (hovering until spawn chunk arrives)
 const v = new THREE.Vector3();
 let yaw = -0.6, pitch = -0.15, onGround = false, fly = false;
-{ // drop spawn onto terrain
+let spawned = false;
+
+// drop the player onto real terrain once the spawn chunk has generated
+function ensureSpawn() {
+  if (spawned) return;
+  const c = store.get('0,0');
+  if (!c || !c.vox) return;
+  spawned = true;
   let y = H - 1;
-  while (y > 0 && !get(W / 2 | 0, y, D / 2 | 0)) y--;
-  p.y = y + 1.01;
+  while (y > 0 && !get(0, y, 0)) y--;
+  p.set(0.5, y + 1.01, 0.5);
 }
 
 const keys = {};
@@ -546,6 +523,9 @@ const blockAtPlayer = (bx, by, bz) =>
   bz + 1 > p.z - PR && bz < p.z + PR;
 
 function step(dt) {
+  camera.position.set(p.x, p.y + EYE, p.z);
+  camera.rotation.set(pitch, yaw, 0);
+  if (!spawned) return;                     // world hasn't streamed in yet
   const fw = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0) + joy.y;
   const st = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) + joy.x;
   const sy = Math.sin(yaw), cy = Math.cos(yaw);
@@ -571,10 +551,7 @@ function step(dt) {
   sweep('z', v.z * dt);
   sweep('y', v.y * dt);
 
-  if (p.y < -14) { p.set(W / 2, H, D / 2); v.set(0, 0, 0); }
-
-  camera.position.set(p.x, p.y + EYE, p.z);
-  camera.rotation.set(pitch, yaw, 0);
+  if (p.y < -14) { p.set(0.5, H + 4, 0.5); v.set(0, 0, 0); spawned = false; ensureSpawn(); }
 }
 
 /* ============================== digging / placing ============================== */
@@ -855,12 +832,13 @@ addEventListener('resize', () => {
 
 /* ============================== loop ============================== */
 
-window.__game = { renderer, camera, scene, p, v, edit, get };
+window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned };
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
   timeU.value += dt;
+  updateChunks();
   step(dt);
   updateAim();
   for (const s of clouds) {
