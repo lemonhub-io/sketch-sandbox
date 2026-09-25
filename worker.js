@@ -1,6 +1,6 @@
 /* worker.js — workerpool worker: terrain generation + meshing, off-thread */
 
-importScripts('vendor/workerpool.js', 'worldcore.js');
+importScripts('vendor/fastnoise-lite.js', 'vendor/workerpool.js', 'worldcore.js');
 
 workerpool.worker({
   gen: (a) => {

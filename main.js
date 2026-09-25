@@ -832,10 +832,8 @@ addEventListener('resize', () => {
 
 /* ============================== loop ============================== */
 
-window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned };
-
 const clock = new THREE.Clock();
-renderer.setAnimationLoop(() => {
+const frame = () => {
   const dt = Math.min(clock.getDelta(), 0.05);
   timeU.value += dt;
   updateChunks();
@@ -846,4 +844,7 @@ renderer.setAnimationLoop(() => {
     if (s.position.x > 110) s.position.x = -55;
   }
   renderer.render(scene, camera);
-});
+};
+renderer.setAnimationLoop(frame);
+
+window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned, frame };

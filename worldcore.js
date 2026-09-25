@@ -46,8 +46,30 @@ function tileUV(t) {  // [u0, v0, u1, v1] inset to avoid bleeding
 
 /* ---------------- terrain ---------------- */
 
+// FastNoiseLite (vendored, MIT) — 3D OpenSimplex2S.
+// Fixed seeds => identical results on main thread and in every worker.
+let nBase = null, nDetail = null;
+if (typeof FastNoiseLite !== 'undefined') {
+  nBase = new FastNoiseLite(1337);
+  nBase.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2S);
+  nBase.SetFractalType(FastNoiseLite.FractalType.FBm);
+  nBase.SetFractalOctaves(4);
+  nBase.SetFrequency(0.012);          // continental scale
+
+  nDetail = new FastNoiseLite(9449);
+  nDetail.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2S);
+  nDetail.SetFrequency(0.085);        // small bumps
+}
+
 // surface height at world column (wx, wz) — pure function, infinite
 function height(wx, wz) {
+  if (nBase) {
+    const t0 = nBase.GetNoise(wx, 0, wz) * 0.5 + 0.5;      // [-1,1] -> [0,1]
+    const t = t0 * t0 * (3 - 2 * t0);                      // widen the range
+    const d = nDetail.GetNoise(wx, 0, wz);                 // [-1,1]
+    return Math.max(1, Math.min(H - 6, Math.floor(2 + t * 13 + d * 2)));
+  }
+  // fallback if FastNoiseLite failed to load
   const n = Math.sin(wx * 0.31) * Math.cos(wz * 0.28) * 1.7
           + Math.sin(wx * 0.11 + 2.1) * Math.cos(wz * 0.13 + 1.3) * 2.6
           + hash2(wx, wz) * 1.4;
