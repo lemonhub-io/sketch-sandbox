@@ -300,13 +300,13 @@ function addWobble(mat, amp) {
     sh.uniforms.uAmp = { value: amp };
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', `#include <common>
-        uniform float uTime; uniform float uAmp; attribute float aSeed;
-        float h3(vec3 p){ return fract(sin(dot(p, vec3(127.1,311.7,74.7))) * 43758.5453); }`)
+        uniform float uTime; uniform float uAmp; attribute float aSeed;`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
         {
           float t = mod(floor(uTime * 5.0), 512.0);
           vec3 sp = position * 0.9 + vec3(aSeed * 37.7, t * 0.913, t * 1.71);
-          transformed += (vec3(h3(sp), h3(sp + 13.7), h3(sp + 27.3)) - 0.5) * uAmp;
+          float h = fract(sin(dot(sp, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+          transformed += (fract(h * vec3(13.13, 71.7, 31.31)) - 0.5) * uAmp;
         }`);
   };
 }
@@ -327,13 +327,20 @@ const FACES = [
   { n: [ 0, 0,-1], c: [[1,0,0],[0,0,0],[0,1,0],[1,1,0]] },
 ];
 
-let worldMesh, worldLines;
+/* the world is split into 16x16 column chunks: edits rebuild only the
+   affected chunk(s), and three.js frustum-culls offscreen chunks */
 
-function buildWorld() {
-  const pos = [], nor = [], uv = [], seed = [], index = [];
+const CS = 16;
+const CXN = Math.ceil(W / CS), CZN = Math.ceil(D / CS);
+const chunks = [];   // cx + cz * CXN -> { mesh, lines }
+
+function buildChunk(cx, cz) {
+  const pos = [], nor = [], uv = [], index = [];
   const lp = [], ls = [];
+  const x0 = cx * CS, x1 = Math.min(x0 + CS, W);
+  const z0 = cz * CS, z1 = Math.min(z0 + CS, D);
 
-  for (let y = 0; y < H; y++) for (let z = 0; z < D; z++) for (let x = 0; x < W; x++) {
+  for (let y = 0; y < H; y++) for (let z = z0; z < z1; z++) for (let x = x0; x < x1; x++) {
     const b = get(x, y, z);
     if (!b) continue;
     const def = BLOCKS[b];
@@ -342,19 +349,25 @@ function buildWorld() {
       if (get(x + F.n[0], y + F.n[1], z + F.n[2])) continue;   // hidden face
       const tile = f === 2 ? def.t[0] : f === 3 ? def.t[1] : def.t[2];
       const [u0, v0, u1, v1] = tileUV(tile);
-      const base = pos.length / 3;
-      const q = F.c.map(cc => [x + cc[0], y + cc[1], z + cc[2]]);
-      for (let k = 0; k < 4; k++) {
-        pos.push(...q[k]);
-        nor.push(...F.n);
-        seed.push(0);
-      }
+      const q0 = F.c[0], q1 = F.c[1], q2 = F.c[2], q3 = F.c[3];
+      const ax = x + q0[0], ay = y + q0[1], az = z + q0[2];
+      const bx = x + q1[0], by = y + q1[1], bz = z + q1[2];
+      const cxv = x + q2[0], cyv = y + q2[1], czv = z + q2[2];
+      const dx = x + q3[0], dy = y + q3[1], dz = z + q3[2];
+      pos.push(ax, ay, az, bx, by, bz, cxv, cyv, czv, dx, dy, dz);
+      for (let k = 0; k < 4; k++) nor.push(F.n[0], F.n[1], F.n[2]);
       uv.push(u0, v0, u1, v0, u1, v1, u0, v1);
+      const base = pos.length / 3 - 4;
       index.push(base, base + 1, base + 2, base, base + 2, base + 3);
-      for (const [a, b2] of [[0,1],[1,2],[2,3],[3,0]]) {      // double sketch stroke
-        lp.push(...q[a], ...q[b2]); ls.push(0, 0);
-        lp.push(...q[a], ...q[b2]); ls.push(1, 1);
-      }
+      // double sketch stroke per edge
+      lp.push(ax, ay, az, bx, by, bz);   ls.push(0, 0);
+      lp.push(ax, ay, az, bx, by, bz);   ls.push(1, 1);
+      lp.push(bx, by, bz, cxv, cyv, czv); ls.push(0, 0);
+      lp.push(bx, by, bz, cxv, cyv, czv); ls.push(1, 1);
+      lp.push(cxv, cyv, czv, dx, dy, dz); ls.push(0, 0);
+      lp.push(cxv, cyv, czv, dx, dy, dz); ls.push(1, 1);
+      lp.push(dx, dy, dz, ax, ay, az);   ls.push(0, 0);
+      lp.push(dx, dy, dz, ax, ay, az);   ls.push(1, 1);
     }
   }
 
@@ -362,26 +375,45 @@ function buildWorld() {
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
   g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
-  g.setAttribute('aSeed', new THREE.Float32BufferAttribute(seed, 1));
   g.setIndex(index);
 
   const lg = new THREE.BufferGeometry();
   lg.setAttribute('position', new THREE.Float32BufferAttribute(lp, 3));
   lg.setAttribute('aSeed', new THREE.Float32BufferAttribute(ls, 1));
 
-  if (!worldMesh) {
-    worldMesh = new THREE.Mesh(g, blockMat);
-    worldLines = new THREE.LineSegments(lg, lineMat);
-    scene.add(worldMesh, worldLines);
+  const i = cx + cz * CXN;
+  let ch = chunks[i];
+  if (!ch) {
+    chunks[i] = {
+      mesh: new THREE.Mesh(g, blockMat),
+      lines: new THREE.LineSegments(lg, lineMat),
+    };
+    scene.add(chunks[i].mesh, chunks[i].lines);
   } else {
-    worldMesh.geometry.dispose(); worldMesh.geometry = g;
-    worldLines.geometry.dispose(); worldLines.geometry = lg;
+    ch.mesh.geometry.dispose(); ch.mesh.geometry = g;
+    ch.lines.geometry.dispose(); ch.lines.geometry = lg;
   }
+}
+
+function buildWorld() {
+  for (let cz = 0; cz < CZN; cz++) for (let cx = 0; cx < CXN; cx++) buildChunk(cx, cz);
+}
+
+// set a voxel and remesh the affected chunk(s), including border neighbors
+function edit(x, y, z, b) {
+  set(x, y, z, b);
+  const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
+  const dirty = [cx + cz * CXN];
+  if (x % CS === 0 && cx > 0) dirty.push(cx - 1 + cz * CXN);
+  if (x % CS === CS - 1 && cx < CXN - 1) dirty.push(cx + 1 + cz * CXN);
+  if (z % CS === 0 && cz > 0) dirty.push(cx + (cz - 1) * CXN);
+  if (z % CS === CS - 1 && cz < CZN - 1) dirty.push(cx + (cz + 1) * CXN);
+  for (const i of dirty) buildChunk(i % CXN, Math.floor(i / CXN));
 }
 
 /* ============================== scene ============================== */
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', stencil: false });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
@@ -582,26 +614,28 @@ function blip(f) {
 
 let selected = 0;
 let aim = null;
+const _dir = new THREE.Vector3();
 
 function updateAim() {
-  const dir = camera.getWorldDirection(new THREE.Vector3());
-  aim = raycast(camera.position, dir, REACH);
+  if (!isActive()) { highlight.visible = false; aim = null; return; }
+  camera.getWorldDirection(_dir);
+  aim = raycast(camera.position, _dir, REACH);
   highlight.visible = !!aim;
   if (aim) highlight.position.set(aim.x + 0.5, aim.y + 0.5, aim.z + 0.5);
 }
 
 function dig() {
   if (!aim) return;
-  set(aim.x, aim.y, aim.z, 0);
-  buildWorld(); blip(190);
+  edit(aim.x, aim.y, aim.z, 0);
+  blip(190);
 }
 
 function place() {
   if (!aim) return;
   const x = aim.x + aim.nx, y = aim.y + aim.ny, z = aim.z + aim.nz;
   if (!inB(x, y, z) || blockAtPlayer(x, y, z)) return;
-  set(x, y, z, PALETTE[selected]);
-  buildWorld(); blip(520);
+  edit(x, y, z, PALETTE[selected]);
+  blip(520);
 }
 
 function pick() {
@@ -821,7 +855,7 @@ addEventListener('resize', () => {
 
 /* ============================== loop ============================== */
 
-window.__game = { renderer, camera, p, v };
+window.__game = { renderer, camera, scene, p, v, edit, get };
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
