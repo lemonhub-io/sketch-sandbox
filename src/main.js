@@ -1,5 +1,15 @@
 import * as THREE from 'three';
 
+// PWA: offline service worker — production only, so dev never sees stale
+// caches. On a deploy, the updated worker claims the page and we reload once.
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register('sw.js');
+  if (hadController) {
+    navigator.serviceWorker.addEventListener('controllerchange', () => location.reload());
+  }
+}
+
 await self.WC_READY;                        // Rust/WASM world core (wasm/wc.*)
 
 /* ============================== config ============================== */

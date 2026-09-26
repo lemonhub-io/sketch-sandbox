@@ -1,0 +1,43 @@
+{
+  "name": "Sketch Sandbox",
+  "short_name": "Sketch Sandbox",
+  "description": "A tiny hand-drawn voxel world. Dig, build, wander — runs fully offline.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "any",
+  "background_color": "#f4eede",
+  "theme_color": "#cfe3ee",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "icons/screenshot-wide.png",
+      "sizes": "1280x760",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "A hand-drawn voxel world rendered in-browser"
+    }
+  ]
+}

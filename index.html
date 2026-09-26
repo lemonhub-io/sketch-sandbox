@@ -3,7 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<link rel="icon" href="data:,">
+<meta name="description" content="A tiny hand-drawn voxel world. Dig, build, wander — runs fully offline.">
+<meta name="theme-color" content="#cfe3ee">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Sketch Sandbox">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <title>Sketch Sandbox</title>
 <link rel="stylesheet" href="/src/style.css">
 </head>
@@ -72,9 +80,10 @@
   <div id="grain"></div>
 
   <!-- classic scripts served verbatim from public/ — the worker needs
-       importScripts-compatible globals (self.WC, FastNoiseLite, workerpool) -->
+       importScripts-compatible globals (wasm_bindgen, workerpool). The world
+       core is the Rust/WASM module in wasm/; worldcore.js kicks off init. -->
   <script src="vendor/workerpool.js"></script>
-  <script src="vendor/fastnoise-lite.js"></script>
+  <script src="wasm/wc.js"></script>
   <script src="worldcore.js"></script>
   <script type="module" src="/src/main.js"></script>
 </body>
