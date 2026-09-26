@@ -993,7 +993,6 @@ pub struct World {
     last: Option<(i32, i32)>,
     inflight: i32,
     tok: i32,
-    needs_scan: bool,
 }
 
 #[wasm_bindgen]
@@ -1008,7 +1007,6 @@ impl World {
             last: None,
             inflight: 0,
             tok: 0,
-            needs_scan: true,
         }
     }
 
@@ -1023,7 +1021,6 @@ impl World {
 
         if self.last != Some((pcx, pcz)) {
             self.last = Some((pcx, pcz));
-            self.needs_scan = true;
             for dz in -self.radius..=self.radius {
                 for dx in -self.radius..=self.radius {
                     let (cx, cz) = (pcx + dx, pcz + dz);
@@ -1041,15 +1038,6 @@ impl World {
                 }
             }
         }
-
-        // nothing changed since the last scan — no chunk arrivals, completions,
-        // or edits — so there can be no new work to dispatch
-        if !self.needs_scan {
-            let a = Int32Array::new_with_length(jobs.len() as u32);
-            a.copy_from(&jobs);
-            return a;
-        }
-        self.needs_scan = false;
 
         let mut gens: Vec<(i32, i64)> = Vec::new();
         let mut meshs: Vec<(i32, i64)> = Vec::new();
@@ -1099,7 +1087,6 @@ impl World {
     /// four neighbours (their border faces may have changed).
     pub fn gen_done(&mut self, cx: i32, cz: i32, tok: i32, data: Option<Uint8Array>) {
         self.inflight -= 1;
-        self.needs_scan = true;   // a worker slot freed — new work may dispatch
         let k = key(cx, cz);
         let mut dirty_neighbours = false;
         if let Some(c) = self.chunks.get_mut(&k) {
@@ -1125,7 +1112,6 @@ impl World {
 
     pub fn mesh_done(&mut self, cx: i32, cz: i32, tok: i32) {
         self.inflight -= 1;
-        self.needs_scan = true;
         if let Some(c) = self.chunks.get_mut(&key(cx, cz)) {
             if c.mesh_in && c.mesh_tok == tok {
                 c.mesh_in = false;
@@ -1216,7 +1202,6 @@ impl World {
                 }
             }
         }
-        self.needs_scan = true;
         true
     }
 

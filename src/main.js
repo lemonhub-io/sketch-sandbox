@@ -239,11 +239,11 @@ atlasTex.minFilter = THREE.LinearMipmapLinearFilter;
    the worker pool that runs the same WASM code off-thread. */
 
 const R = 4;                            // view radius in chunks
-const MAXTASKS = 16;                    // in-flight worker jobs cap
+const MAXTASKS = 8;                     // in-flight worker jobs cap
 const world = new self.WC.World(R, MAXTASKS);   // WASM: chunk store, edits, scheduler
-const render = new Map();               // "cx,cz" -> {geoId, instId, mesh, lines}
+const render = new Map();               // "cx,cz" -> {mesh, lines}
 const meshQ = [];                       // worker results awaiting geometry upload
-const APPLY_BUDGET = 1.5;               // ms of main-thread geometry apply per frame
+const MAXAPPLY = 4;                     // geometry builds per frame — no burst stalls
 const ckey = (cx, cz) => cx + ',' + cz;
 
 const get = (x, y, z) => world.get(x, y, z);
@@ -252,8 +252,7 @@ const inB = (x, y, z) => y >= 0 && y < H;
 const psolid = (x, y, z) => world.solid(x, y, z);
 
 let pool = null;
-const NWORK = Math.min(8, Math.max(4, (navigator.hardwareConcurrency || 6) - 2));
-try { pool = self.workerpool.pool('worker.js', { minWorkers: 'max', maxWorkers: NWORK }); } catch (e) {}
+try { pool = self.workerpool.pool('worker.js', { minWorkers: 'max', maxWorkers: 4 }); } catch (e) {}
 let poolFails = 0;
 // if workers keep dying (missing script, wasm init failure...) stop paying
 // the spawn-fail-reject round-trip per task and run everything on-thread
@@ -266,10 +265,8 @@ function poolFail() {
 
 function runGen(cx, cz, tok) {
   const done = data => { world.gen_done(cx, cz, tok, data); ensureSpawn(); };
-  const edits = world.edits_flat(cx, cz);
   const sync = () => setTimeout(() => done(self.WC.gen_chunk(cx, cz, world.edits_flat(cx, cz))), 0);
-  if (pool) pool.exec('gen', [{ cx, cz, edits }], { transfer: edits ? [edits.buffer] : [] })
-    .then(r => done(r.data), () => { poolFail(); sync(); });
+  if (pool) pool.exec('gen', [{ cx, cz, edits: world.edits_flat(cx, cz) }]).then(r => done(r.data), () => { poolFail(); sync(); });
   else sync();
 }
 
@@ -286,9 +283,7 @@ function runMesh(cx, cz, tok) {
     px: world.voxels(cx + 1, cz), nx: world.voxels(cx - 1, cz),
     pz: world.voxels(cx, cz + 1), nz: world.voxels(cx, cz - 1),
   };
-  // zero-copy the five voxel buffers into the worker instead of cloning
-  const xfer = [args.self, args.px, args.nx, args.pz, args.nz].filter(Boolean).map(a => a.buffer);
-  if (pool) pool.exec('mesh', [args], { transfer: xfer }).then(done, () => { poolFail(); sync(); });
+  if (pool) pool.exec('mesh', [args]).then(done, () => { poolFail(); sync(); });
   else sync();
 }
 
@@ -414,27 +409,7 @@ addWobble(lineMat, 0.06);
 /* ============================== scene ============================== */
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', stencil: false });
-// adaptive resolution: pixel-ratio scaled by a slow frame-time governor — the
-// sketch look tolerates softness far better than dropped frames
-const PRMAX = Math.min(devicePixelRatio || 1, 1.75);
-let prScale = 1, emaDt = 1 / 60, prTick = 0, prHot = 0, prCool = 0;
-function adaptRes(rawDt) {
-  emaDt = emaDt * 0.94 + Math.min(rawDt, 0.05) * 0.06;
-  if (++prTick < 40) return;                     // reevaluate ~every 0.7s
-  prTick = 0;
-  if (emaDt > 0.0208) { prHot++; prCool = 0; }   // sustained <48fps
-  else if (emaDt < 0.0175) { prCool++; prHot = 0; }
-  else { prHot = prCool = 0; }
-  const next = prHot >= 2 ? Math.max(0.5, prScale - 0.2)
-             : prCool >= 10 ? Math.min(1, prScale + 0.1)
-             : prScale;
-  if (next !== prScale) {
-    prScale = next; prHot = prCool = 0;
-    renderer.setPixelRatio(PRMAX * prScale);
-    renderer.setSize(innerWidth, innerHeight);
-  }
-}
-renderer.setPixelRatio(PRMAX);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 document.getElementById('app').appendChild(renderer.domElement);
 
@@ -1101,16 +1076,11 @@ function updateLoad() {
 
 const clock = new THREE.Clock();
 const frame = () => {
-  const rawDt = clock.getDelta();
-  const dt = Math.min(rawDt, 0.05);
+  const dt = Math.min(clock.getDelta(), 0.05);
   timeU.value += dt;
-  adaptRes(rawDt);
   updateChunks();
   updateLoad();
-  // drain mesh results on a time budget — always at least one, but never a
-  // burst of geometry uploads long enough to drop the frame
-  const at = performance.now();
-  for (let n = 0; meshQ.length && (n === 0 || performance.now() - at < APPLY_BUDGET); n++) {
+  for (let i = 0; i < MAXAPPLY && meshQ.length; i++) {
     const m = meshQ.shift();
     applyMesh(m.cx, m.cz, m.tok, m.r);
   }
@@ -1123,7 +1093,6 @@ const frame = () => {
   }
   renderer.render(scene, camera);
 };
-renderer.compile(scene, camera);          // warm all programs before play — no first-frame shader hitch
 renderer.setAnimationLoop(frame);
 
 window.__game = { renderer, camera, scene, p, v, edit, get, world, render, spawned: () => spawned, frame, pool: () => pool, screen: () => screen, parts, dig };
