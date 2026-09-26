@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 
+await self.WC_READY;                        // Rust/WASM world core (wasm/wc.*)
+
 /* ============================== config ============================== */
 
 const { H, CS, B, T, BLOCKS } = self.WC;    // shared world core (worldcore.js)
@@ -221,37 +223,28 @@ atlasTex.magFilter = THREE.LinearFilter;
 atlasTex.minFilter = THREE.LinearMipmapLinearFilter;
 
 /* ============================== infinite voxel world ==============================
-   Voxels live per-chunk (16x16 columns, full height). Terrain + meshing run
-   in a worker pool; the main thread keeps the voxel map for physics/raycast
-   and applies geometry results. Chunks stream in/out around the player. */
+   Voxel data, the streaming scheduler, terrain generation and meshing all live
+   in the Rust/WASM world core (worldcore.js -> wasm/wc.*). What remains here is
+   render-side state: THREE geometry per chunk and a budgeted apply queue, plus
+   the worker pool that runs the same WASM code off-thread. */
 
-const R = 4;                          // view radius in chunks
-const MAXTASKS = 8;                   // in-flight worker jobs cap
-const store = new Map();              // "cx,cz" -> {cx,cz,vox,mesh,lines,genIn,meshIn,dirty}
-const edits = new Map();              // "cx,cz" -> Map<lidx, block> (player edits, kept on unload)
+const R = 4;                            // view radius in chunks
+const MAXTASKS = 8;                     // in-flight worker jobs cap
+const world = new self.WC.World(R, MAXTASKS);   // WASM: chunk store, edits, scheduler
+const render = new Map();               // "cx,cz" -> {mesh, lines}
+const meshQ = [];                       // worker results awaiting geometry upload
+const MAXAPPLY = 4;                     // geometry builds per frame — no burst stalls
 const ckey = (cx, cz) => cx + ',' + cz;
-const lidx = (x, y, z) => (x & (CS - 1)) + (z & (CS - 1)) * CS + y * CS * CS;
 
-const chunkAt = (x, z) => store.get(ckey(Math.floor(x / CS), Math.floor(z / CS)));
-
-const get = (x, y, z) => {
-  if (y < 0 || y >= H) return 0;
-  const c = chunkAt(x, z);
-  return c && c.vox ? c.vox[lidx(x, y, z)] : 0;
-};
+const get = (x, y, z) => world.get(x, y, z);
 const inB = (x, y, z) => y >= 0 && y < H;
 // not-yet-loaded chunks act as walls so the player can't fall into the void
-const psolid = (x, y, z) => {
-  if (y < 0 || y >= H) return false;
-  const c = chunkAt(x, z);
-  return !c || !c.vox ? true : c.vox[lidx(x, y, z)] !== 0;
-};
+const psolid = (x, y, z) => world.solid(x, y, z);
 
 let pool = null;
 try { pool = self.workerpool.pool('worker.js', { minWorkers: 'max', maxWorkers: 4 }); } catch (e) {}
-let inflight = 0;
 let poolFails = 0;
-// if workers keep dying (missing script, importScripts error...) stop paying
+// if workers keep dying (missing script, wasm init failure...) stop paying
 // the spawn-fail-reject round-trip per task and run everything on-thread
 function poolFail() {
   if (pool && ++poolFails >= 3) {
@@ -260,50 +253,33 @@ function poolFail() {
   }
 }
 
-function chunkState(cx, cz) {
-  const k = ckey(cx, cz);
-  let c = store.get(k);
-  if (!c) { c = { cx, cz, vox: null, mesh: null, lines: null, genIn: false, meshIn: false, dirty: false }; store.set(k, c); }
-  return c;
-}
-
-function onVox(c, data) {
-  if (store.get(ckey(c.cx, c.cz)) !== c) return;      // unloaded meanwhile
-  c.vox = data;
-  c.dirty = true;
-  for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-    const n = store.get(ckey(c.cx + dx, c.cz + dz));
-    if (n && n.vox) n.dirty = true;                    // its border faces changed
-  }
-  ensureSpawn();
-}
-
-const meshQ = [];                       // worker results awaiting geometry upload
-const MAXAPPLY = 4;                     // geometry builds per frame — no burst stalls
-
-function runGen(c) {
-  c.genIn = true; inflight++;
-  const e = edits.get(ckey(c.cx, c.cz));
-  const ed = e ? [...e] : null;
-  const done = data => { inflight--; c.genIn = false; onVox(c, data); };
-  const sync = () => setTimeout(() => done(WC.genChunk(c.cx, c.cz, ed)), 0);
-  if (pool) pool.exec('gen', [{ cx: c.cx, cz: c.cz, edits: ed }]).then(r => done(r.data), () => { poolFail(); sync(); });
+function runGen(cx, cz, tok) {
+  const done = data => { world.gen_done(cx, cz, tok, data); ensureSpawn(); };
+  const sync = () => setTimeout(() => done(self.WC.gen_chunk(cx, cz, world.edits_flat(cx, cz))), 0);
+  if (pool) pool.exec('gen', [{ cx, cz, edits: world.edits_flat(cx, cz) }]).then(r => done(r.data), () => { poolFail(); sync(); });
   else sync();
 }
 
-function runMesh(c) {
-  c.meshIn = true; c.dirty = false; inflight++;
-  const nb = (dx, dz) => { const n = store.get(ckey(c.cx + dx, c.cz + dz)); return n ? n.vox : null; };
-  const args = { cx: c.cx, cz: c.cz, self: c.vox, px: nb(1, 0), nx: nb(-1, 0), pz: nb(0, 1), nz: nb(0, -1) };
-  const done = r => { inflight--; c.meshIn = false; meshQ.push({ c, r }); };
-  const sync = () => setTimeout(() => done(WC.meshChunk(c.cx, c.cz, args.self, args.px, args.nx, args.pz, args.nz)), 0);
+function runMesh(cx, cz, tok) {
+  const done = r => { world.mesh_done(cx, cz, tok); if (r) meshQ.push({ cx, cz, tok, r }); };
+  const sync = () => setTimeout(() => {
+    const m = world.mesh_chunk(cx, cz);   // WASM reads neighbours straight from its store
+    done(m ? { pos: m.pos, nor: m.nor, uv: m.uv, index: m.index, lp: m.lp, ls: m.ls } : null);
+    if (m) m.free();
+  }, 0);
+  const args = {
+    cx, cz,
+    self: world.voxels(cx, cz),
+    px: world.voxels(cx + 1, cz), nx: world.voxels(cx - 1, cz),
+    pz: world.voxels(cx, cz + 1), nz: world.voxels(cx, cz - 1),
+  };
   if (pool) pool.exec('mesh', [args]).then(done, () => { poolFail(); sync(); });
   else sync();
 }
 
 // main-thread geometry build — budgeted from frame() via meshQ
-function applyMesh(c, r) {
-  if (store.get(ckey(c.cx, c.cz)) !== c || !c.vox || c.dirty) return;  // stale/unloaded
+function applyMesh(cx, cz, tok, r) {
+  if (!world.mesh_valid(cx, cz, tok)) return;   // stale / unloaded / re-dirtied
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(r.pos, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(r.nor, 3));
@@ -312,63 +288,40 @@ function applyMesh(c, r) {
   const lg = new THREE.BufferGeometry();
   lg.setAttribute('position', new THREE.BufferAttribute(r.lp, 3));
   lg.setAttribute('aSeed', new THREE.BufferAttribute(r.ls, 1));
-  if (!c.mesh) {
-    c.mesh = new THREE.Mesh(g, blockMat);
-    c.lines = new THREE.LineSegments(lg, lineMat);
-    c.mesh.matrixAutoUpdate = c.lines.matrixAutoUpdate = false;
-    scene.add(c.mesh, c.lines);
+  const k = ckey(cx, cz);
+  let e = render.get(k);
+  if (!e) {
+    e = { mesh: new THREE.Mesh(g, blockMat), lines: new THREE.LineSegments(lg, lineMat) };
+    e.mesh.matrixAutoUpdate = e.lines.matrixAutoUpdate = false;
+    render.set(k, e);
+    scene.add(e.mesh, e.lines);
   } else {
-    c.mesh.geometry.dispose(); c.mesh.geometry = g;
-    c.lines.geometry.dispose(); c.lines.geometry = lg;
+    e.mesh.geometry.dispose(); e.mesh.geometry = g;
+    e.lines.geometry.dispose(); e.lines.geometry = lg;
   }
 }
 
-function unload(c) {
-  if (c.mesh) { scene.remove(c.mesh, c.lines); c.mesh.geometry.dispose(); c.lines.geometry.dispose(); }
-  store.delete(ckey(c.cx, c.cz));
+function unloadRender(cx, cz) {
+  const e = render.get(ckey(cx, cz));
+  if (!e) return;
+  scene.remove(e.mesh, e.lines);
+  e.mesh.geometry.dispose(); e.lines.geometry.dispose();
+  render.delete(ckey(cx, cz));
 }
 
-let lastCX = null, lastCZ = null;
 function updateChunks() {
-  const pcx = Math.floor(p.x / CS), pcz = Math.floor(p.z / CS);
-  if (pcx !== lastCX || pcz !== lastCZ) {
-    lastCX = pcx; lastCZ = pcz;
-    for (let dz = -R; dz <= R; dz++)
-      for (let dx = -R; dx <= R; dx++)
-        chunkState(pcx + dx, pcz + dz);
-    for (const c of [...store.values()])
-      if (Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz)) > R + 1) unload(c);
+  const jobs = world.update(p.x, p.z);    // flat [tag, cx, cz, tok, ...]
+  for (let i = 0; i + 3 < jobs.length; i += 4) {
+    const cx = jobs[i + 1], cz = jobs[i + 2], tok = jobs[i + 3];
+    if (jobs[i] === self.WC.JOB_GEN) runGen(cx, cz, tok);
+    else if (jobs[i] === self.WC.JOB_MESH) runMesh(cx, cz, tok);
+    else unloadRender(cx, cz);
   }
-  const needGen = [], needMesh = [];
-  for (const c of store.values()) {
-    const d = Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz));
-    if (!c.vox && !c.genIn) needGen.push([d, c]);
-    else if (c.vox && c.dirty && !c.meshIn) needMesh.push([d, c]);
-  }
-  needGen.sort((a, b) => a[0] - b[0]);
-  needMesh.sort((a, b) => a[0] - b[0]);
-  for (const [, c] of needGen)  { if (inflight >= MAXTASKS) break; runGen(c); }
-  for (const [, c] of needMesh) { if (inflight >= MAXTASKS) break; runMesh(c); }
 }
 
 // set a voxel, persist the edit, and remesh the affected chunk(s)
 function edit(wx, wy, wz, b) {
-  const cx = Math.floor(wx / CS), cz = Math.floor(wz / CS);
-  const c = store.get(ckey(cx, cz));
-  if (!c || !c.vox) return;
-  const i = lidx(wx, wy, wz);
-  c.vox[i] = b;
-  const k = ckey(cx, cz);
-  let e = edits.get(k);
-  if (!e) edits.set(k, e = new Map());
-  e.set(i, b);
-  c.dirty = true;
-  const lx = wx - cx * CS, lz = wz - cz * CS;
-  const mark = (dx, dz) => { const n = store.get(ckey(cx + dx, cz + dz)); if (n && n.vox) n.dirty = true; };
-  if (lx === 0) mark(-1, 0);
-  if (lx === CS - 1) mark(1, 0);
-  if (lz === 0) mark(0, -1);
-  if (lz === CS - 1) mark(0, 1);
+  world.edit(wx, wy, wz, b);
 }
 
 /* ============================== sketch materials ============================== */
@@ -558,8 +511,7 @@ let spawned = false;
 // drop the player onto real terrain once the spawn chunk has generated
 function ensureSpawn() {
   if (spawned) return;
-  const c = store.get('0,0');
-  if (!c || !c.vox) return;
+  if (!world.has_voxels(0, 0)) return;
   spawned = true;
   let y = H - 1;
   while (y > 0 && !get(0, y, 0)) y--;
@@ -1044,9 +996,8 @@ addEventListener('resize', () => {
 let lastPct = -1, lastMsg = '';
 function updateLoad() {
   if (screen !== 'menu') return;
-  let meshed = 0;
-  for (const c of store.values()) if (c.mesh) meshed++;
-  const total = store.size || 1;
+  const meshed = render.size;
+  const total = world.chunk_count() || 1;
   const pct = Math.min(100, Math.round(meshed / total * 100));
   if (pct !== lastPct) { lastPct = pct; loadfill.style.width = pct + '%'; }
   const ready = spawned && meshed >= total;
@@ -1065,7 +1016,7 @@ const frame = () => {
   updateLoad();
   for (let i = 0; i < MAXAPPLY && meshQ.length; i++) {
     const m = meshQ.shift();
-    applyMesh(m.c, m.r);
+    applyMesh(m.cx, m.cz, m.tok, m.r);
   }
   step(dt);
   stepParts(dt);
@@ -1078,4 +1029,4 @@ const frame = () => {
 };
 renderer.setAnimationLoop(frame);
 
-window.__game = { renderer, camera, scene, p, v, edit, get, store, spawned: () => spawned, frame, pool: () => pool, screen: () => screen, parts, dig };
+window.__game = { renderer, camera, scene, p, v, edit, get, world, render, spawned: () => spawned, frame, pool: () => pool, screen: () => screen, parts, dig };

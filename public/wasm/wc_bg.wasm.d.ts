@@ -1,0 +1,34 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_meshresult_free: (a: number, b: number) => void;
+export const __wbg_world_free: (a: number, b: number) => void;
+export const gen_chunk: (a: number, b: number, c: number) => any;
+export const mesh_chunk_raw: (a: number, b: number, c: any, d: number, e: number, f: number, g: number) => number;
+export const meshresult_index: (a: number) => any;
+export const meshresult_lp: (a: number) => any;
+export const meshresult_ls: (a: number) => any;
+export const meshresult_nor: (a: number) => any;
+export const meshresult_pos: (a: number) => any;
+export const meshresult_uv: (a: number) => any;
+export const world_chunk_count: (a: number) => number;
+export const world_consts: () => any;
+export const world_edit: (a: number, b: number, c: number, d: number, e: number) => number;
+export const world_edits_flat: (a: number, b: number, c: number) => any;
+export const world_gen_done: (a: number, b: number, c: number, d: number, e: number) => void;
+export const world_get: (a: number, b: number, c: number, d: number) => number;
+export const world_has_voxels: (a: number, b: number, c: number) => number;
+export const world_inflight: (a: number) => number;
+export const world_mesh_chunk: (a: number, b: number, c: number) => number;
+export const world_mesh_done: (a: number, b: number, c: number, d: number) => void;
+export const world_mesh_valid: (a: number, b: number, c: number, d: number) => number;
+export const world_new: (a: number, b: number) => number;
+export const world_solid: (a: number, b: number, c: number, d: number) => number;
+export const world_update: (a: number, b: number, c: number) => any;
+export const world_voxels: (a: number, b: number, c: number) => any;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_start: () => void;

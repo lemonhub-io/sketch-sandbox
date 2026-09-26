@@ -1,0 +1,11 @@
+{
+  "name": "worldcore",
+  "version": "0.1.0",
+  "files": [
+    "wc_bg.wasm",
+    "wc.js",
+    "wc.d.ts"
+  ],
+  "browser": "wc.js",
+  "types": "wc.d.ts"
+}
