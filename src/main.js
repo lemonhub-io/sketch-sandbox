@@ -274,7 +274,7 @@ function runMesh(cx, cz, tok) {
   const done = r => { world.mesh_done(cx, cz, tok); if (r) meshQ.push({ cx, cz, tok, r }); };
   const sync = () => setTimeout(() => {
     const m = world.mesh_chunk(cx, cz);   // WASM reads neighbours straight from its store
-    done(m ? { pos: m.pos, nor: m.nor, uv: m.uv, index: m.index, lp: m.lp, ls: m.ls } : null);
+    done(m ? { pos: m.pos, nor: m.nor, uv: m.uv, tile: m.tile, index: m.index, lp: m.lp, ls: m.ls } : null);
     if (m) m.free();
   }, 0);
   const args = {
@@ -294,19 +294,41 @@ function applyMesh(cx, cz, tok, r) {
   g.setAttribute('position', new THREE.BufferAttribute(r.pos, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(r.nor, 3));
   g.setAttribute('uv', new THREE.BufferAttribute(r.uv, 2));
+  g.setAttribute('aTile', new THREE.BufferAttribute(r.tile, 1));
   g.setIndex(new THREE.BufferAttribute(r.index, 1));
+  g.computeBoundingSphere();                  // per-instance culling + partial upload
   const lg = new THREE.BufferGeometry();
   lg.setAttribute('position', new THREE.BufferAttribute(r.lp, 3));
   lg.setAttribute('aSeed', new THREE.BufferAttribute(r.ls, 1));
   const k = ckey(cx, cz);
   let e = render.get(k);
-  if (!e) {
-    e = { mesh: new THREE.Mesh(g, blockMat), lines: new THREE.LineSegments(lg, lineMat) };
-    e.mesh.matrixAutoUpdate = e.lines.matrixAutoUpdate = false;
-    render.set(k, e);
-    scene.add(e.mesh, e.lines);
-  } else {
+  if (e && e.geoId >= 0) {
+    try {
+      batch.setGeometryAt(e.geoId, g);
+    } catch (err) {                           // grew past the reserved slot
+      batch.deleteGeometry(e.geoId);          // frees the instance too
+      e.geoId = batch.addGeometry(g, Math.max(RSV_VERTS, r.pos.length / 3),
+        Math.max(RSV_INDEX, r.index.length));
+      batch.addInstance(e.geoId);
+    }
+  } else if (e && e.mesh) {
     e.mesh.geometry.dispose(); e.mesh.geometry = g;
+  }
+  if (!e) {
+    e = { geoId: -1, instId: -1, mesh: null, lines: null };
+    try {
+      e.geoId = batch.addGeometry(g, RSV_VERTS, RSV_INDEX);
+      e.instId = batch.addInstance(e.geoId);
+    } catch (err) {                           // batch pool full — standalone fallback
+      e.mesh = new THREE.Mesh(g, blockMat);
+      e.mesh.matrixAutoUpdate = false;
+      scene.add(e.mesh);
+    }
+    e.lines = new THREE.LineSegments(lg, lineMat);
+    e.lines.matrixAutoUpdate = false;
+    render.set(k, e);
+    scene.add(e.lines);
+  } else {
     e.lines.geometry.dispose(); e.lines.geometry = lg;
   }
 }
@@ -314,8 +336,10 @@ function applyMesh(cx, cz, tok, r) {
 function unloadRender(cx, cz) {
   const e = render.get(ckey(cx, cz));
   if (!e) return;
-  scene.remove(e.mesh, e.lines);
-  e.mesh.geometry.dispose(); e.lines.geometry.dispose();
+  if (e.geoId >= 0) batch.deleteGeometry(e.geoId);
+  if (e.mesh) { scene.remove(e.mesh); e.mesh.geometry.dispose(); }
+  scene.remove(e.lines);
+  e.lines.geometry.dispose();
   render.delete(ckey(cx, cz));
 }
 
@@ -356,8 +380,29 @@ function addWobble(mat, amp) {
   };
 }
 
+// greedy-meshed quads carry uv in block units + an aTile index; wrap the
+// Lambert uv so each unit repeats the tile exactly like the old per-voxel uvs
+function addTiledUV(mat) {
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = (sh) => {
+    if (prev) prev(sh);
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `#include <common>
+        attribute float aTile;`)
+      .replace('#include <uv_vertex>', `#include <uv_vertex>
+        {
+          vec2 fuv = fract(uv);
+          float tc = mod(aTile, ${ATLAS}.0), tr = floor(aTile / ${ATLAS}.0);
+          vMapUv = vec2(
+            tc * ${TS}.0 + ${PAD}.0 + fuv.x * ${TS - 2 * PAD}.0,
+            ${ATLAS * TS}.0 - (tr * ${TS}.0 + ${TS - PAD}.0 - fuv.y * ${TS - 2 * PAD}.0)) / ${ATLAS * TS}.0;
+        }`);
+  };
+}
+
 const blockMat = new THREE.MeshLambertMaterial({ map: atlasTex });
 addWobble(blockMat, 0.03);
+addTiledUV(blockMat);
 const lineMat = new THREE.LineBasicMaterial({ color: 0x3a3026, transparent: true, opacity: 0.8 });
 addWobble(lineMat, 0.06);
 
@@ -371,6 +416,17 @@ document.getElementById('app').appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xcfe3ee);
 scene.fog = new THREE.Fog(0xcfe3ee, 45, 120);
+
+// all chunk block-geometry lives in one batched draw call; each chunk gets a
+// geometry slot (reserved capacity so in-place updates fit) + one instance at
+// the identity matrix (positions are already world-space)
+const RSV_VERTS = 8192, RSV_INDEX = 12288;
+const batch = new THREE.BatchedMesh(128, 128 * RSV_VERTS, 128 * RSV_INDEX, blockMat);
+batch.matrixAutoUpdate = false;
+batch.frustumCulled = false;            // the union bound goes stale as chunks stream
+batch.perObjectFrustumCulled = true;    // per-chunk bounding spheres do the culling
+batch.sortObjects = false;              // opaque — no per-frame depth sort needed
+scene.add(batch);
 
 const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 300);
 camera.rotation.order = 'YXZ';

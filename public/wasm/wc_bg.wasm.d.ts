@@ -10,6 +10,7 @@ export const meshresult_lp: (a: number) => any;
 export const meshresult_ls: (a: number) => any;
 export const meshresult_nor: (a: number) => any;
 export const meshresult_pos: (a: number) => any;
+export const meshresult_tile: (a: number) => any;
 export const meshresult_uv: (a: number) => any;
 export const world_chunk_count: (a: number) => number;
 export const world_consts: () => any;

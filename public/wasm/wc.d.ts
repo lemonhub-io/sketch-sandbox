@@ -11,6 +11,7 @@ declare namespace wasm_bindgen {
         readonly ls: Float32Array;
         readonly nor: Float32Array;
         readonly pos: Float32Array;
+        readonly tile: Float32Array;
         readonly uv: Float32Array;
     }
 
@@ -82,6 +83,7 @@ declare interface InitOutput {
     readonly meshresult_ls: (a: number) => any;
     readonly meshresult_nor: (a: number) => any;
     readonly meshresult_pos: (a: number) => any;
+    readonly meshresult_tile: (a: number) => any;
     readonly meshresult_uv: (a: number) => any;
     readonly world_chunk_count: (a: number) => number;
     readonly world_consts: () => any;

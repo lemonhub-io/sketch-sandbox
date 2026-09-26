@@ -25,12 +25,12 @@ workerpool.worker({
     const m = meshChunkRaw(a.cx, a.cz, a.self, a.px, a.nx, a.pz, a.nz);
     const r = {
       cx: a.cx, cz: a.cz,
-      pos: m.pos, nor: m.nor, uv: m.uv,
+      pos: m.pos, nor: m.nor, uv: m.uv, tile: m.tile,
       index: m.index, lp: m.lp, ls: m.ls,
     };
     m.free();
     return new workerpool.Transfer(r, [
-      r.pos.buffer, r.nor.buffer, r.uv.buffer,
+      r.pos.buffer, r.nor.buffer, r.uv.buffer, r.tile.buffer,
       r.index.buffer, r.lp.buffer, r.ls.buffer,
     ]);
   },

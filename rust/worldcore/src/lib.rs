@@ -588,6 +588,7 @@ pub struct MeshResult {
     pos: Vec<f32>,
     nor: Vec<f32>,
     uv: Vec<f32>,
+    tile: Vec<f32>,
     index: Vec<u32>,
     lp: Vec<f32>,
     ls: Vec<f32>,
@@ -614,6 +615,12 @@ impl MeshResult {
         a
     }
     #[wasm_bindgen(getter)]
+    pub fn tile(&self) -> Float32Array {
+        let a = Float32Array::new_with_length(self.tile.len() as u32);
+        a.copy_from(&self.tile);
+        a
+    }
+    #[wasm_bindgen(getter)]
     pub fn index(&self) -> Uint32Array {
         let a = Uint32Array::new_with_length(self.index.len() as u32);
         a.copy_from(&self.index);
@@ -633,51 +640,13 @@ impl MeshResult {
     }
 }
 
-fn tile_uv(t: u8) -> [f32; 4] {
-    let at = (ATLAS as f64) * TS;
-    let col = (t as i32 % ATLAS) as f64;
-    let row = (t as i32 / ATLAS) as f64;
-    let u0 = (col * TS + PAD) / at;
-    let u1 = ((col + 1.0) * TS - PAD) / at;
-    let v1 = 1.0 - (row * TS + PAD) / at;
-    let v0 = 1.0 - ((row + 1.0) * TS - PAD) / at;
-    [u0 as f32, v0 as f32, u1 as f32, v1 as f32]
-}
-
-fn sample(
-    selfv: &[u8],
-    px: Option<&[u8]>,
-    nx: Option<&[u8]>,
-    pz: Option<&[u8]>,
-    nz: Option<&[u8]>,
-    x: i32,
-    y: i32,
-    z: i32,
-) -> u8 {
-    if y < 0 || y >= H {
-        return 0;
-    }
-    if x < 0 {
-        return nx.map_or(0, |n| n[(x + CS + z * CS + y * YS) as usize]);
-    }
-    if x >= CS {
-        return px.map_or(0, |n| n[(x - CS + z * CS + y * YS) as usize]);
-    }
-    if z < 0 {
-        return nz.map_or(0, |n| n[(x + (z + CS) * CS + y * YS) as usize]);
-    }
-    if z >= CS {
-        return pz.map_or(0, |n| n[(x + (z - CS) * CS + y * YS) as usize]);
-    }
-    selfv[(x + z * CS + y * YS) as usize]
-}
-
-const LS_FACE: [f32; 16] = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+const LS_EDGE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
 struct MeshOut {
     pos: Vec<f32>,
     nor: Vec<f32>,
     uv: Vec<f32>,
+    tile: Vec<f32>,
     index: Vec<u32>,
     lp: Vec<f32>,
     ls: Vec<f32>,
@@ -686,167 +655,71 @@ struct MeshOut {
 impl MeshOut {
     fn new() -> Self {
         MeshOut {
-            pos: Vec::new(),
-            nor: Vec::new(),
-            uv: Vec::new(),
-            index: Vec::new(),
-            lp: Vec::new(),
-            ls: Vec::new(),
+            pos: Vec::with_capacity(16384),
+            nor: Vec::with_capacity(16384),
+            uv: Vec::with_capacity(16384),
+            tile: Vec::with_capacity(8192),
+            index: Vec::with_capacity(16384),
+            lp: Vec::with_capacity(65536),
+            ls: Vec::with_capacity(16384),
         }
     }
 
+    /// One merged quad. uv is emitted in block units (0..w × 0..h); the shader
+    /// repeats the atlas tile per unit via fract().
     #[inline]
-    fn face(&mut self, def: [u8; 3], f: usize, x0: i32, z0: i32, x: i32, y: i32, z: i32) {
-        let (n, c) = &FACES[f];
-        let tile = if f == 2 {
-            def[0]
-        } else if f == 3 {
-            def[1]
-        } else {
-            def[2]
-        };
-        let uvr = tile_uv(tile);
-        let q0 = c[0];
-        let q1 = c[1];
-        let q2 = c[2];
-        let q3 = c[3];
-        let ax = (x0 + x + q0[0]) as f32;
-        let ay = (y + q0[1]) as f32;
-        let az = (z0 + z + q0[2]) as f32;
-        let bx = (x0 + x + q1[0]) as f32;
-        let by = (y + q1[1]) as f32;
-        let bz = (z0 + z + q1[2]) as f32;
-        let cxv = (x0 + x + q2[0]) as f32;
-        let cyv = (y + q2[1]) as f32;
-        let czv = (z0 + z + q2[2]) as f32;
-        let dx = (x0 + x + q3[0]) as f32;
-        let dy = (y + q3[1]) as f32;
-        let dz = (z0 + z + q3[2]) as f32;
-        self.pos
-            .extend_from_slice(&[ax, ay, az, bx, by, bz, cxv, cyv, czv, dx, dy, dz]);
-        let (nx, ny, nzv) = (n[0] as f32, n[1] as f32, n[2] as f32);
+    fn quad(&mut self, f: usize, verts: [[f32; 3]; 4], tile: u8, w: i32, h: i32) {
+        let base = (self.pos.len() / 3) as u32;
+        for v in verts {
+            self.pos.extend_from_slice(&v);
+        }
+        let n = &FACES[f].0;
+        let (nx, ny, nz) = (n[0] as f32, n[1] as f32, n[2] as f32);
         self.nor.extend_from_slice(&[
-            nx, ny, nzv, nx, ny, nzv, nx, ny, nzv, nx, ny, nzv,
+            nx, ny, nz, nx, ny, nz, nx, ny, nz, nx, ny, nz,
         ]);
-        self.uv.extend_from_slice(&[
-            uvr[0], uvr[1], uvr[2], uvr[1], uvr[2], uvr[3], uvr[0], uvr[3],
-        ]);
-        let base = (self.pos.len() / 3 - 4) as u32;
+        let (w, h) = (w as f32, h as f32);
+        self.uv.extend_from_slice(&[0.0, 0.0, w, 0.0, w, h, 0.0, h]);
+        let t = tile as f32;
+        self.tile.extend_from_slice(&[t, t, t, t]);
         self.index
             .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        self.lp.extend_from_slice(&[
-            ax, ay, az, bx, by, bz, ax, ay, az, bx, by, bz, bx, by, bz, cxv, cyv, czv, bx, by,
-            bz, cxv, cyv, czv, cxv, cyv, czv, dx, dy, dz, cxv, cyv, czv, dx, dy, dz, dx, dy,
-            dz, ax, ay, az, dx, dy, dz, ax, ay, az,
-        ]);
-        self.ls.extend_from_slice(&LS_FACE);
     }
 
+    /// One outline segment, emitted twice like the original (the aSeed pair
+    /// gives the line-boil shader two jitter variants of the same edge).
     #[inline]
-    fn voxel(
-        &mut self,
-        selfv: &[u8],
-        px: Option<&[u8]>,
-        nx: Option<&[u8]>,
-        pz: Option<&[u8]>,
-        nz: Option<&[u8]>,
-        x0: i32,
-        z0: i32,
-        x: i32,
-        y: i32,
-        z: i32,
-        b: u8,
-    ) {
-        let def = BLOCK_TILES[b as usize];
-        for f in 0..6 {
-            let (n, _) = &FACES[f];
-            if sample(selfv, px, nx, pz, nz, x + n[0], y + n[1], z + n[2]) != 0 {
-                continue;
-            }
-            self.face(def, f, x0, z0, x, y, z);
-        }
-    }
-
-    fn row_scalar(
-        &mut self,
-        selfv: &[u8],
-        px: Option<&[u8]>,
-        nx: Option<&[u8]>,
-        pz: Option<&[u8]>,
-        nz: Option<&[u8]>,
-        x0: i32,
-        z0: i32,
-        y: i32,
-        z: i32,
-    ) {
-        for x in 0..CS {
-            let b = selfv[(x + z * CS + y * YS) as usize];
-            if b == 0 {
-                continue;
-            }
-            self.voxel(selfv, px, nx, pz, nz, x0, z0, x, y, z, b);
-        }
-    }
-
-    /// SIMD row: for interior (y,z) rows, one v128 load per direction gives the
-    /// 16-lane "neighbour is air" masks; lanes with a solid block and at least
-    /// one open in-chunk neighbour — or sitting on the x border — run the face
-    /// emit directly off the mask bits (per-lane sample() calls skipped).
-    #[cfg(target_feature = "simd128")]
-    fn row_simd(
-        &mut self,
-        selfv: &[u8],
-        px: Option<&[u8]>,
-        nx: Option<&[u8]>,
-        pz: Option<&[u8]>,
-        nz: Option<&[u8]>,
-        x0: i32,
-        z0: i32,
-        y: i32,
-        z: i32,
-    ) {
-        if y < 1 || y >= H - 1 || z < 1 || z >= CS - 1 {
-            return self.row_scalar(selfv, px, nx, pz, nz, x0, z0, y, z);
-        }
-        let base = (z * CS + y * YS) as usize;
-        unsafe {
-            let p = selfv.as_ptr();
-            let ld = |o: isize| v128_load(p.offset(base as isize + o) as *const v128);
-            let zero = i8x16_splat(0);
-            let open = |o: isize| (i8x16_bitmask(i8x16_eq(ld(o), zero)) as u32) & 0xffff;
-            let solid = (i8x16_bitmask(i8x16_ne(ld(0), zero)) as u32) & 0xffff;
-            let mxm = open(-1);
-            let mxp = open(1);
-            let mym = open(-(YS as isize));
-            let myp = open(YS as isize);
-            let mzm = open(-(CS as isize));
-            let mzp = open(CS as isize);
-            let mut work = solid & (mxm | mxp | mym | myp | mzm | mzp | 0x8001);
-            while work != 0 {
-                let x = work.trailing_zeros();
-                work &= work - 1;
-                let b = selfv[base + x as usize];
-                if x == 0 || x == (CS - 1) as u32 {
-                    self.voxel(selfv, px, nx, pz, nz, x0, z0, x as i32, y, z, b);
-                    continue;
-                }
-                let bits = ((mxp >> x) & 1)
-                    | ((mxm >> x) & 1) << 1
-                    | ((myp >> x) & 1) << 2
-                    | ((mym >> x) & 1) << 3
-                    | ((mzp >> x) & 1) << 4
-                    | ((mzm >> x) & 1) << 5;
-                let def = BLOCK_TILES[b as usize];
-                for f in 0..6usize {
-                    if bits & (1 << f) != 0 {
-                        self.face(def, f, x0, z0, x as i32, y, z);
-                    }
-                }
-            }
-        }
+    fn edge(&mut self, a: [f32; 3], b: [f32; 3]) {
+        self.lp.extend_from_slice(&[
+            a[0], a[1], a[2], b[0], b[1], b[2], a[0], a[1], a[2], b[0], b[1], b[2],
+        ]);
+        self.ls.extend_from_slice(&LS_EDGE);
     }
 }
 
+/// Map a point in a face's (u,v) plane at slice s to world-space coords.
+/// Face planes: f0/f1 = +x/-x (u=z, v=y), f2/f3 = +y/-y (u=x, v=z),
+/// f4/f5 = +z/-z (u=x, v=y).
+#[inline]
+fn plane_to_world(f: usize, u: i32, v: i32, s: i32, x0: i32, z0: i32) -> [f32; 3] {
+    match f {
+        0 => [(x0 + s + 1) as f32, v as f32, (z0 + u) as f32],
+        1 => [(x0 + s) as f32, v as f32, (z0 + u) as f32],
+        2 => [(x0 + u) as f32, (s + 1) as f32, (z0 + v) as f32],
+        3 => [(x0 + u) as f32, s as f32, (z0 + v) as f32],
+        4 => [(x0 + u) as f32, v as f32, (z0 + s + 1) as f32],
+        _ => [(x0 + u) as f32, v as f32, (z0 + s) as f32],
+    }
+}
+
+/// Greedy mesher: per face direction, build a chunk-wide exposure mask
+/// (block id where the neighbour cell along the face axis is transparent) by
+/// shifting the voxel array into a neighbour buffer — contiguous copies plus
+/// a border column from the adjacent chunk — then vectorising
+/// mask = self & (nb == 0). Sweep axis slices: emit the unit-edge outline grid
+/// once per unique edge, then merge same-block mask regions into maximal
+/// rects — one quad per rect. Corner order replicates FACES exactly, so
+/// triangle winding (and therefore GPU backface culling) is unchanged.
 fn mesh_voxels(
     cx: i32,
     cz: i32,
@@ -859,13 +732,186 @@ fn mesh_voxels(
     let mut out = MeshOut::new();
     let x0 = cx.wrapping_mul(CS);
     let z0 = cz.wrapping_mul(CS);
+    let n = (CS * CS * H) as usize;
+    let (cs, ys) = (CS as usize, YS as usize);
+    let mut nbuf = vec![0u8; n];
+    let mut mask = vec![0u8; n];
 
-    for y in 0..H {
-        for z in 0..CS {
-            #[cfg(target_feature = "simd128")]
-            out.row_simd(selfv, px, nx, pz, nz, x0, z0, y, z);
-            #[cfg(not(target_feature = "simd128"))]
-            out.row_scalar(selfv, px, nx, pz, nz, x0, z0, y, z);
+    for f in 0..6usize {
+        // nbuf[i] = voxel value adjacent to cell i along the face direction
+        match f {
+            0 => {
+                // +x: interior neighbour is the next cell; x=15 column reads px
+                nbuf[..n - 1].copy_from_slice(&selfv[1..]);
+                for v in 0..H {
+                    for u in 0..CS {
+                        nbuf[(15 + u * CS + v * YS) as usize] =
+                            px.map_or(0, |p| p[(u * CS + v * YS) as usize]);
+                    }
+                }
+            }
+            1 => {
+                nbuf[1..].copy_from_slice(&selfv[..n - 1]);
+                for v in 0..H {
+                    for u in 0..CS {
+                        nbuf[(u * CS + v * YS) as usize] =
+                            nx.map_or(0, |p| p[(15 + u * CS + v * YS) as usize]);
+                    }
+                }
+            }
+            2 => {
+                nbuf[..n - ys].copy_from_slice(&selfv[ys..]);
+                nbuf[n - ys..].fill(0); // y=23 ceiling -> air
+            }
+            3 => {
+                nbuf[ys..].copy_from_slice(&selfv[..n - ys]);
+                nbuf[..ys].fill(0); // y=0 floor -> air
+            }
+            4 => {
+                nbuf[..n - cs].copy_from_slice(&selfv[cs..]);
+                for v in 0..H {
+                    // z=15 rows read pz's z=0 row (x-contiguous)
+                    let dst = (15 * CS + v * YS) as usize;
+                    let src = (v * YS) as usize;
+                    match pz {
+                        Some(p) => nbuf[dst..dst + cs].copy_from_slice(&p[src..src + cs]),
+                        None => nbuf[dst..dst + cs].fill(0),
+                    }
+                }
+            }
+            _ => {
+                nbuf[cs..].copy_from_slice(&selfv[..n - cs]);
+                for v in 0..H {
+                    // z=0 rows read nz's z=15 row (x-contiguous)
+                    let dst = (v * YS) as usize;
+                    let src = (15 * CS + v * YS) as usize;
+                    match nz {
+                        Some(p) => nbuf[dst..dst + cs].copy_from_slice(&p[src..src + cs]),
+                        None => nbuf[dst..dst + cs].fill(0),
+                    }
+                }
+            }
+        }
+
+        // mask[i] = selfv[i] where the neighbour is air, else 0
+        #[cfg(target_feature = "simd128")]
+        for i in (0..n).step_by(16) {
+            let b = unsafe { v128_load(selfv.as_ptr().add(i) as *const v128) };
+            let nb = unsafe { v128_load(nbuf.as_ptr().add(i) as *const v128) };
+            let m = v128_and(b, i8x16_eq(nb, i8x16_splat(0)));
+            unsafe { v128_store(mask.as_mut_ptr().add(i) as *mut v128, m) };
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        for i in 0..n {
+            mask[i] = if nbuf[i] == 0 { selfv[i] } else { 0 };
+        }
+
+        // (udim, vdim, sdim) = face-plane dims + sweep count;
+        // (ss, su, sv) = mask strides mapping plane coords to chunk-linear idx
+        let (udim, vdim, sdim, ss, su, sv) = match f {
+            0 | 1 => (CS, H, CS, 1, CS, YS),   // ±x: plane (z, y), sweep x
+            2 | 3 => (CS, CS, H, YS, 1, CS),   // ±y: plane (x, z), sweep y
+            _ => (CS, H, CS, CS, 1, YS),       // ±z: plane (x, y), sweep z
+        };
+
+        let mut rowbits = [0u32; H as usize];
+
+        for s in 0..sdim {
+            let base = (s * ss) as usize;
+            let midx = |u: i32, v: i32| base + (v * sv + u * su) as usize;
+
+            // per-row activity bitmask; empty rows skip all edge/greedy work
+            for v in 0..vdim {
+                #[cfg(target_feature = "simd128")]
+                if su == 1 {
+                    let m = unsafe {
+                        v128_load(mask.as_ptr().add(base + (v * sv) as usize) as *const v128)
+                    };
+                    rowbits[v as usize] = !(i8x16_bitmask(i8x16_eq(m, i8x16_splat(0))) as u32)
+                        & 0xffff;
+                    continue;
+                }
+                let mut b = 0u32;
+                for u in 0..udim {
+                    if mask[midx(u, v)] != 0 {
+                        b |= 1 << u;
+                    }
+                }
+                rowbits[v as usize] = b;
+            }
+
+            // outline grid: each unit edge emitted once when either adjacent
+            // cell is exposed (same visual as per-face edges, minus dupes)
+            for v in 0..=vdim {
+                let mut bits = (if v < vdim { rowbits[v as usize] } else { 0 })
+                    | (if v > 0 { rowbits[v as usize - 1] } else { 0 });
+                while bits != 0 {
+                    let u = bits.trailing_zeros() as i32;
+                    bits &= bits - 1;
+                    let a = plane_to_world(f, u, v, s, x0, z0);
+                    let b = plane_to_world(f, u + 1, v, s, x0, z0);
+                    out.edge(a, b);
+                }
+            }
+            for v in 0..vdim {
+                let mut bits = rowbits[v as usize] | (rowbits[v as usize] << 1);
+                bits &= (1 << (udim + 1)) - 1;
+                while bits != 0 {
+                    let u = bits.trailing_zeros() as i32;
+                    bits &= bits - 1;
+                    let a = plane_to_world(f, u, v, s, x0, z0);
+                    let b = plane_to_world(f, u, v + 1, s, x0, z0);
+                    out.edge(a, b);
+                }
+            }
+
+            // greedy merge: max horizontal run, then extend vertically while
+            // every row in [v, v+h) matches the run exactly
+            for v in 0..vdim {
+                if rowbits[v as usize] == 0 {
+                    continue;
+                }
+                let mut u = 0;
+                while u < udim {
+                    let b = mask[midx(u, v)];
+                    if b == 0 {
+                        u += 1;
+                        continue;
+                    }
+                    let mut w = 1i32;
+                    while u + w < udim && mask[midx(u + w, v)] == b {
+                        w += 1;
+                    }
+                    let mut h = 1i32;
+                    'grow: while v + h < vdim {
+                        for du in 0..w {
+                            if mask[midx(u + du, v + h)] != b {
+                                break 'grow;
+                            }
+                        }
+                        h += 1;
+                    }
+                    for dv in 0..h {
+                        for du in 0..w {
+                            mask[midx(u + du, v + dv)] = 0;
+                        }
+                    }
+                    let tile = match f {
+                        2 => BLOCK_TILES[b as usize][0],
+                        3 => BLOCK_TILES[b as usize][1],
+                        _ => BLOCK_TILES[b as usize][2],
+                    };
+                    let corners: [[i32; 2]; 4] = match f {
+                        0 => [[u + w, v], [u, v], [u, v + h], [u + w, v + h]],
+                        2 => [[u, v + h], [u + w, v + h], [u + w, v], [u, v]],
+                        5 => [[u + w, v], [u, v], [u, v + h], [u + w, v + h]],
+                        _ => [[u, v], [u + w, v], [u + w, v + h], [u, v + h]],
+                    };
+                    let verts = corners.map(|c| plane_to_world(f, c[0], c[1], s, x0, z0));
+                    out.quad(f, verts, tile, w, h);
+                    u += w;
+                }
+            }
         }
     }
 
@@ -873,6 +919,7 @@ fn mesh_voxels(
         pos: out.pos,
         nor: out.nor,
         uv: out.uv,
+        tile: out.tile,
         index: out.index,
         lp: out.lp,
         ls: out.ls,

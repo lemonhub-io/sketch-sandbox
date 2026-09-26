@@ -59,6 +59,13 @@ let wasm_bindgen = (function(exports) {
         /**
          * @returns {Float32Array}
          */
+        get tile() {
+            const ret = wasm.meshresult_tile(this.__wbg_ptr);
+            return ret;
+        }
+        /**
+         * @returns {Float32Array}
+         */
         get uv() {
             const ret = wasm.meshresult_uv(this.__wbg_ptr);
             return ret;
